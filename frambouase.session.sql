@@ -20,13 +20,22 @@ CREATE TABLE IF NOT EXISTS Links (
 );
 
 CREATE TABLE IF NOT EXISTS Unexplored (
-  id INT AUTO_INCREMENT,
+  id INT NOT NULL,
+  bugged BOOLEAN DEFAULT false,
   FOREIGN KEY (id) REFERENCES Pages(id)
 );
 
 CREATE TRIGGER add_page_to_unexplored 
 AFTER INSERT ON Pages
 FOR EACH ROW
-INSERT INTO Unexplored VALUES (NEW.id);
+INSERT INTO Unexplored VALUES (NEW.id, FALSE);
 
-INSERT IGNORE INTO Pages(url) VALUES ("France");
+INSERT INTO Pages(url) VALUES ("France");
+
+-- @block
+
+SELECT * FROM Pages;
+
+SELECT Pages.id, Pages.url FROM Unexplored
+JOIN Pages ON Unexplored.id = Pages.id
+WHERE Unexplored.bugged = FALSE ORDER BY Pages.id ASC;

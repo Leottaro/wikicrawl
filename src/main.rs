@@ -1,8 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 
 use mysql::prelude::*;
 use mysql::*;
 use regex::Regex;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::Sender;
+use tokio::task;
 use urlencoding::decode;
 
 const ENV_PATH: &str = ".env";
@@ -35,54 +39,65 @@ async fn main() -> Result<(), Error> {
         )));
     }
 
-    let url = format!(
+    let url = Arc::new(RwLock::new(format!(
         "mysql://{}:{}@{}:{}/wikicrawl",
         vars["USER"], vars["PASSWORD"], vars["HOST"], vars["PORT"]
-    );
-    println!("Connecting to {}", url);
+    )));
 
-    let pool: &Pool = &Pool::new(url.as_str()).unwrap();
-    let connection: &mut PooledConn = &mut pool.get_conn().unwrap();
+    let main_pool: &Pool = &Pool::new(url.read().expect("unable to read URL").as_str()).unwrap();
+    let main_connection: &mut PooledConn = &mut main_pool.get_conn().unwrap();
 
-    let mut offset: usize = 0;
+    let (tx, mut rx) = mpsc::channel::<i32>(255);
+    let num_children = 16;
+    let mut child_count = 0;
 
-    loop {
-        let exploring_pages = get_n_unexplored(connection, offset + 1);
-        if exploring_pages.is_err() {
-            offset += 1;
+    for child_id in 0..num_children {
+        println!("Init child {}", child_id);
+        let err = spawn_child(main_connection, tx.clone(), url.clone(), child_id);
+        if err.is_err() {
+            eprintln!(
+                "Error failed to spawn child {}: {}",
+                child_id,
+                err.unwrap_err()
+            );
+        } else {
+            child_count += 1;
+        }
+    }
+
+    while let Some(child_id) = rx.recv().await {
+        // a child has terminated
+        println!("child {} has terminated", child_id);
+        child_count -= 1;
+
+        let err = spawn_child(main_connection, tx.clone(), url.clone(), child_id);
+        if err.is_err() {
+            eprintln!(
+                "Error failed to spawn child {}: {}",
+                child_id,
+                err.unwrap_err()
+            );
+        } else {
+            child_count += 1;
+        }
+
+        if child_count >= num_children {
             continue;
         }
-        let pages = exploring_pages.unwrap();
-        let page = pages.get(offset).unwrap();
-
-        let explore_result = explore(connection, page).await;
-        if explore_result.is_err() {
-            println!(
-                "Error happened during page ({}, \"{}\") explore: {}",
-                page.id,
-                page.url,
-                explore_result.unwrap_err()
+        println!("Init child {}", child_count);
+        let err2 = spawn_child(main_connection, tx.clone(), url.clone(), child_count);
+        if err2.is_err() {
+            eprintln!(
+                "Error failed to spawn child {}: {}",
+                child_count,
+                err2.unwrap_err()
             );
-            offset += 1;
+        } else {
+            child_count += 1;
         }
-
-        let total_pages = connection
-            .query_first("SELECT COUNT(*) FROM Pages;")
-            .unwrap_or(Some(-1))
-            .unwrap_or(-1);
-
-        let unexplored_pages = connection
-            .query_first("SELECT COUNT(*) FROM Unexplored;")
-            .unwrap_or(Some(-1))
-            .unwrap_or(-1);
-
-        println!(
-            "Explored pages: {}/{} ({}%)",
-            total_pages - unexplored_pages,
-            total_pages,
-            (total_pages - unexplored_pages) as f32 / (total_pages as f32) * 100.0
-        );
     }
+
+    Ok(())
 }
 
 fn read_env() -> Result<HashMap<String, String>, Error> {
@@ -125,29 +140,89 @@ fn read_env() -> Result<HashMap<String, String>, Error> {
         .collect::<HashMap<String, String>>())
 }
 
-fn get_n_unexplored(connection: &mut PooledConn, n: usize) -> Result<Vec<Page>, Error> {
+fn spawn_child(
+    main_connection: &mut PooledConn,
+    shared_tx: Sender<i32>,
+    shared_url: Arc<RwLock<String>>,
+    child_id: i32,
+) -> Result<(), Error> {
+    let unexplored_result = get_unexplored(main_connection);
+    if unexplored_result.is_err() {
+        return Err(unexplored_result.unwrap_err());
+    }
+    let page = unexplored_result.unwrap();
+
+    let mark_bugged_result = mark_bugged(main_connection, &page);
+    if mark_bugged_result.is_err() {
+        return Err(mark_bugged_result.unwrap_err());
+    }
+
+    task::spawn(async move {
+        let url = shared_url.read().expect("Unable to read url 1").clone();
+        let pool: &Pool = &Pool::new(url.as_str()).unwrap();
+        let connection = &mut pool.get_conn().unwrap();
+        let result = explore(connection, &page).await;
+        if result.is_err() {
+            // println!("Error: {}", result.unwrap_err());
+        }
+        shared_tx.send(child_id).await.unwrap();
+    });
+
+    Ok(())
+}
+
+fn get_unexplored(connection: &mut PooledConn) -> Result<Page, Error> {
     connection
-        .query_map(
-            format!("SELECT Pages.id, Pages.url FROM Unexplored JOIN Pages ON Pages.id = Unexplored.id ORDER BY Unexplored.id ASC LIMIT {};", n),
-            |(id, url)| Page { id, url },
+        .query_first("SELECT Pages.id, Pages.url FROM Unexplored JOIN Pages ON Unexplored.id = Pages.id WHERE Unexplored.bugged = FALSE ORDER BY Pages.id ASC;")
+        .map_or_else(
+            |err| Err(err),
+            |row: Option<Row>| {
+                if row.is_none() {
+                    Err(Error::from(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Error: No unexplored pages found",
+                    )))
+                } else {
+                    let temp = row.unwrap();
+                    Ok(Page {
+                        id: temp.get(0).unwrap(),
+                        url: temp.get(1).unwrap(),
+                    })
+                }
+            },
         )
 }
 
+fn mark_bugged(connection: &mut PooledConn, page: &Page) -> Result<(), Error> {
+    connection.exec_drop(
+        "UPDATE Unexplored SET bugged = TRUE WHERE id = :id;",
+        params! {"id" => page.id},
+    )
+}
+
 async fn explore(connection: &mut PooledConn, page: &Page) -> Result<(), Error> {
-    println!("\nExploring page ({}, \"{}\")", page.id, page.url);
+    // println!("\nExploring page ({}, \"{}\")", page.id, page.url);
     let regex: Regex = Regex::new(r#"['"]/wiki/([a-zA-Z0-9./=_%\-()]*.)['"]"#).unwrap();
 
     let body = reqwest::get(format!("https://fr.wikipedia.org/wiki/{}", page.url))
         .await
-        .map_err(|err| println!("Error: Couldn't reach page {}: {}", page.url, err))
+        // .map_err(|err| println!("Error: Couldn't reach page {}: {}", page.url, err))
         .unwrap()
         .text()
-        .await
-        .map_err(|err| println!("Error: Couldn't get text of page {}: {}", page.url, err))
-        .unwrap();
+        .await;
+    if body.is_err() {
+        return Err(Error::from(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "Error: Couldn't get text of page {}: {}",
+                page.url,
+                body.unwrap_err()
+            ),
+        )));
+    }
 
     let found_links: Vec<String> = regex
-        .captures_iter(&body)
+        .captures_iter(body.unwrap().as_str())
         .map(|captures| {
             decode(captures.get(1).unwrap().as_str())
                 .unwrap()
@@ -166,23 +241,23 @@ async fn explore(connection: &mut PooledConn, page: &Page) -> Result<(), Error> 
 
     let found_pages: Result<Vec<Page>, Error> = new_pages(connection, &found_links);
     if found_pages.is_err() {
-        eprintln!(
-            "an Error occured while creating new pages of page ({}, \"{}\"): {}",
-            page.id,
-            page.url,
-            found_pages.as_ref().unwrap_err(),
-        );
+        // eprintln!(
+        //     "an Error occured while creating new pages of page ({}, \"{}\"): {}",
+        //     page.id,
+        //     page.url,
+        //     found_pages.as_ref().unwrap_err(),
+        // );
         return Err(found_pages.unwrap_err());
     }
 
     let link_error = new_links(connection, &page, &found_pages.unwrap());
     if link_error.is_err() {
-        eprintln!(
-            "an Error occured while creating new links of page ({}, \"{}\"): {}",
-            page.id,
-            page.url,
-            link_error.as_ref().unwrap_err()
-        );
+        // eprintln!(
+        //     "an Error occured while creating new links of page ({}, \"{}\"): {}",
+        //     page.id,
+        //     page.url,
+        //     link_error.as_ref().unwrap_err()
+        // );
         return Err(link_error.unwrap_err());
     }
 
@@ -191,12 +266,12 @@ async fn explore(connection: &mut PooledConn, page: &Page) -> Result<(), Error> 
         params! {"id" => page.id},
     );
     if delete_error.is_err() {
-        eprintln!(
-            "Error deleting unexplored page (id: {}, url: \"{}\"): {}",
-            page.id,
-            page.url,
-            delete_error.as_ref().unwrap_err()
-        );
+        // eprintln!(
+        //     "Error deleting unexplored page (id: {}, url: \"{}\"): {}",
+        //     page.id,
+        //     page.url,
+        //     delete_error.as_ref().unwrap_err()
+        // );
         return Err(delete_error.unwrap_err());
     }
 
@@ -204,7 +279,7 @@ async fn explore(connection: &mut PooledConn, page: &Page) -> Result<(), Error> 
 }
 
 fn new_pages(connection: &mut PooledConn, urls: &Vec<String>) -> Result<Vec<Page>, Error> {
-    println!("Creating new pages");
+    // println!("Creating new pages");
     let insert_query: String = format!(
         "INSERT IGNORE INTO Pages(url) VALUES (\"{}\");",
         urls.join("\"), (\"")
@@ -227,7 +302,7 @@ fn new_links(
     current_page: &Page,
     linked_pages: &Vec<Page>,
 ) -> Result<(), Error> {
-    println!("Creating new links");
+    // println!("Creating new links");
     let inserted_values: Vec<String> = linked_pages
         .into_iter()
         .map(|page| format!("({}, \"{}\")", current_page.id, page.id))
