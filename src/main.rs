@@ -13,8 +13,7 @@ use urlencoding::decode;
 
 const ENV_PATH: &str = ".env";
 const ENV_DEFAULT: &str =
-    "WIKICRAWL_USER=root\nWIKICRAWL_PASSWORD=root\nWIKICRAWL_HOST=localhost\nWIKICRAWL_PORT=3306";
-const MAX_CONCURRENT_PAGES: usize = 60;
+    "WIKICRAWL_USER=root\nWIKICRAWL_PASSWORD=root\nWIKICRAWL_HOST=localhost\nWIKICRAWL_PORT=3306\nWIKICRAWL_CONCURRENT_PAGES=200";
 
 #[derive(Debug)]
 struct Page {
@@ -24,7 +23,7 @@ struct Page {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let url = get_url().unwrap();
+    let (url, max_concurrent_pages) = get_url().unwrap();
     let pool = Pool::new(url.as_str()).unwrap();
     let mut connection = pool.get_conn().unwrap();
 
@@ -64,7 +63,7 @@ async fn main() -> Result<(), Error> {
         println!("getting unexplored pages");
         last_query = format!(
             "SELECT id, url FROM Pages WHERE explored = false ORDER BY id ASC LIMIT {};",
-            MAX_CONCURRENT_PAGES
+            max_concurrent_pages
         );
         let unexplored_result = connection.query_map(&last_query, |(id, url)| Page { id, url });
         if unexplored_result.is_err() {
@@ -108,8 +107,8 @@ async fn main() -> Result<(), Error> {
                 print!(
                     "\rwaiting for threads to finish {}/{} ({}%)            ",
                     thread_pages.len(),
-                    MAX_CONCURRENT_PAGES,
-                    thread_pages.len() * 100 / MAX_CONCURRENT_PAGES
+                    max_concurrent_pages,
+                    thread_pages.len() * 100 / max_concurrent_pages
                 );
                 std::io::stdout().flush().unwrap();
             }));
@@ -117,7 +116,7 @@ async fn main() -> Result<(), Error> {
 
         print!(
             "waiting for threads to finish 0/{} (0%)",
-            MAX_CONCURRENT_PAGES
+            max_concurrent_pages
         );
         std::io::stdout().flush().unwrap();
 
@@ -162,6 +161,7 @@ async fn main() -> Result<(), Error> {
                     .join(", ")
             );
             print!("marking bugged pages ");
+            std::io::stdout().flush().unwrap();
             let bugged_result = connection.query_drop(&last_query);
             if bugged_result.is_err() {
                 eprintln!("\nlast query: {}", last_query);
@@ -175,7 +175,7 @@ async fn main() -> Result<(), Error> {
         } else {
             // insert new pages
             last_query = format!(
-                "INSERT INTO Pages (id, url) VALUES {};",
+                "INSERT IGNORE INTO Pages (id, url) VALUES {};",
                 found_pages
                     .iter()
                     .map(|page| format!("({}, \"{}\")", page.id, page.url))
@@ -183,6 +183,7 @@ async fn main() -> Result<(), Error> {
                     .join(",")
             );
             print!("inserting new pages ");
+            std::io::stdout().flush().unwrap();
             let new_pages_result = connection.query_drop(&last_query);
             if new_pages_result.is_err() {
                 eprintln!("\nlast query: {}", last_query);
@@ -191,6 +192,8 @@ async fn main() -> Result<(), Error> {
             println!("(inserted {} pages)", found_pages.len());
 
             // transform the results array into an array of relations between pages
+            print!("generating relations ");
+            std::io::stdout().flush().unwrap();
             let relations_found = results
                 .iter()
                 .filter(|(_, links)| links.is_some())
@@ -210,10 +213,11 @@ async fn main() -> Result<(), Error> {
                 })
                 .flatten()
                 .collect::<Vec<(&Page, &Page)>>();
+            println!("(finished {} relations)", relations_found.len());
 
             // insert the new relations
             last_query = format!(
-                "INSERT INTO Links (linker, linked) VALUES {}",
+                "INSERT IGNORE INTO Links (linker, linked) VALUES {}",
                 relations_found
                     .iter()
                     .map(|(linker, linked)| format!("({},{})", linker.id, linked.id))
@@ -238,6 +242,7 @@ async fn main() -> Result<(), Error> {
                 .join(", ")
         );
         print!("marking pages as explored ");
+        std::io::stdout().flush().unwrap();
         let mark_unexplored_result = connection.query_drop(&last_query);
         if mark_unexplored_result.is_err() {
             eprintln!("\nlast query: {}", last_query);
@@ -248,7 +253,7 @@ async fn main() -> Result<(), Error> {
     return Ok(());
 }
 
-fn get_url() -> Result<String, Error> {
+fn get_url() -> Result<(String, usize), Error> {
     let env_read = std::fs::read_to_string(ENV_PATH);
     if env_read.is_err() {
         let env_write = std::fs::write(ENV_PATH, ENV_DEFAULT);
@@ -292,20 +297,24 @@ fn get_url() -> Result<String, Error> {
         )));
     }
 
-    Ok(format!(
-        "mysql://{}:{}@{}:{}/wikicrawl",
-        vars["USER"], vars["PASSWORD"], vars["HOST"], vars["PORT"]
+    Ok((
+        format!(
+            "mysql://{}:{}@{}:{}/wikicrawl",
+            vars["USER"], vars["PASSWORD"], vars["HOST"], vars["PORT"]
+        ),
+        vars["CONCURRENT_PAGES"].parse::<usize>().unwrap_or(200),
     ))
 }
 
 async fn explore(url: &String) -> Result<Vec<String>, Error> {
     let regex: Regex = Regex::new(r#"['"]/wiki/([a-zA-Z0-9./=_%\-()]*.)['"]"#).unwrap();
 
-    let body = reqwest::get(format!("https://fr.wikipedia.org/wiki/{}", url))
+    let body = reqwest::get(format!("https://fr.m.wikipedia.org/wiki/{}", url))
         .await
         .unwrap()
         .text()
         .await;
+
     if body.is_err() {
         return Err(Error::from(std::io::Error::new(
             std::io::ErrorKind::Other,

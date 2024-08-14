@@ -23,5 +23,6 @@ INSERT INTO Pages (id, url) VALUES (1, "France");
 
 -- @block
 SELECT * FROM Pages;
+
 -- @block
 SELECT * FROM Links;
