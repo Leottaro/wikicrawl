@@ -1,212 +1,308 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use mysql::prelude::*;
 use mysql::*;
 use regex::Regex;
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::Sender;
+use signal_hook::consts::SIGINT;
+use signal_hook::iterator::Signals;
 use tokio::task;
 use urlencoding::decode;
 
 const ENV_PATH: &str = ".env";
 const ENV_DEFAULT: &str =
     "WIKICRAWL_USER=root\nWIKICRAWL_PASSWORD=root\nWIKICRAWL_HOST=localhost\nWIKICRAWL_PORT=3306";
+const MAX_CONCURRENT_PAGES: usize = 60;
 
 #[derive(Debug)]
 struct Page {
-    id: i32,
+    id: usize,
     url: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let env = read_env();
-    if env.is_err() {
-        return Err(env.unwrap_err());
-    }
+    let url = get_url().unwrap();
+    let pool = Pool::new(url.as_str()).unwrap();
+    let mut connection = pool.get_conn().unwrap();
 
-    let vars = env.unwrap();
-    if !vars.contains_key("USER")
-        || !vars.contains_key("PASSWORD")
-        || !vars.contains_key("HOST")
-        || !vars.contains_key("PORT")
-    {
-        eprintln!("Error: .env file is missing some values, delete it to see default values or fill it with the following values:\n{}", ENV_DEFAULT);
-        return Err(Error::from(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            ".env file is missing some values, see error message",
-        )));
-    }
+    let shared_bool = Arc::new(Mutex::new(true));
+    let shared_bool_clone = Arc::clone(&shared_bool);
+    let mut signals = Signals::new(&[SIGINT])?;
+    thread::spawn(move || {
+        for sig in signals.forever() {
+            if sig != SIGINT {
+                continue;
+            }
 
-    let url = Arc::new(RwLock::new(format!(
-        "mysql://{}:{}@{}:{}/wikicrawl",
-        vars["USER"], vars["PASSWORD"], vars["HOST"], vars["PORT"]
-    )));
+            let mut val = shared_bool.lock().unwrap();
+            if *val {
+                println!("\nSIGINT received, waiting for the program to stop");
+                *val = false;
+            } else {
+                println!("\nSIGINT received again, forcing the program to stop");
+                std::process::exit(0);
+            }
+        }
+    });
 
-    let main_pool: &Pool = &Pool::new(url.read().expect("unable to read URL").as_str()).unwrap();
-    let main_connection: &mut PooledConn = &mut main_pool.get_conn().unwrap();
+    let mut last_query: String;
+    while *shared_bool_clone.lock().unwrap() {
+        // get greatest page id
+        println!("\ngetting greatest page id");
+        last_query = "SELECT MAX(id) FROM Pages;".to_string();
+        let greatest_id_result: Result<Option<usize>, Error> = connection.query_first(&last_query);
+        if greatest_id_result.is_err() {
+            eprintln!("\nlast query: {}", last_query);
+            return Err(greatest_id_result.unwrap_err());
+        }
+        let greatest_id = greatest_id_result.unwrap().unwrap_or(0);
 
-    let (tx, mut rx) = mpsc::channel::<i32>(255);
-    let num_children = 16;
-    let mut child_count = 0;
+        // get unexplored pages
+        println!("getting unexplored pages");
+        last_query = format!(
+            "SELECT id, url FROM Pages WHERE explored = false ORDER BY id ASC LIMIT {};",
+            MAX_CONCURRENT_PAGES
+        );
+        let unexplored_result = connection.query_map(&last_query, |(id, url)| Page { id, url });
+        if unexplored_result.is_err() {
+            eprintln!("\nlast query: {}", last_query);
+            return Err(unexplored_result.unwrap_err());
+        }
+        let unexplored_pages = unexplored_result.unwrap();
+        let unexplored_length = unexplored_pages.len();
+        if unexplored_length < 1 {
+            eprintln!("\nlast query: {}", last_query);
+            return Err(Error::from(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No unexplored pages found",
+            )));
+        }
 
-    for child_id in 0..num_children {
-        println!("Init child {}", child_id);
-        let err = spawn_child(main_connection, tx.clone(), url.clone(), child_id);
-        if err.is_err() {
-            eprintln!(
-                "Error failed to spawn child {}: {}",
-                child_id,
-                err.unwrap_err()
+        println!(
+            "Exploring pages: {}",
+            unexplored_pages
+                .iter()
+                .map(|page| format!("\"{}\"", page.url))
+                .collect::<Vec<String>>()
+                .join(", ")
+        );
+
+        let pages: Arc<Mutex<Vec<(Page, Option<Vec<String>>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut children: Vec<task::JoinHandle<()>> = Vec::new();
+
+        println!("spawning threads");
+
+        for page in unexplored_pages {
+            let shared_pages = Arc::clone(&pages);
+            children.push(task::spawn(async move {
+                let explore_result = explore(&page.url).await;
+                let mut thread_pages = shared_pages.lock().unwrap();
+                if explore_result.is_ok() {
+                    thread_pages.push((page, Some(explore_result.unwrap())));
+                } else {
+                    thread_pages.push((page, None));
+                }
+                print!(
+                    "\rwaiting for threads to finish {}/{} ({}%)            ",
+                    thread_pages.len(),
+                    MAX_CONCURRENT_PAGES,
+                    thread_pages.len() * 100 / MAX_CONCURRENT_PAGES
+                );
+                std::io::stdout().flush().unwrap();
+            }));
+        }
+
+        print!(
+            "waiting for threads to finish 0/{} (0%)",
+            MAX_CONCURRENT_PAGES
+        );
+        std::io::stdout().flush().unwrap();
+
+        for child in children.into_iter() {
+            let child_result = child.await;
+            if child_result.is_err() {
+                return Err(Error::from(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    child_result.unwrap_err(),
+                )));
+            }
+            child_result.unwrap();
+        }
+
+        println!("\rthreads finished");
+
+        let results = pages.lock().unwrap();
+        let found_links = results
+            .iter()
+            .filter(|(_, links)| links.is_some())
+            .map(|(_, links)| links.clone().to_owned().unwrap())
+            .flatten()
+            .collect::<HashSet<String>>();
+        let found_pages = found_links
+            .into_iter()
+            .enumerate()
+            .map(|(id, url)| Page {
+                id: greatest_id + id + 1,
+                url,
+            })
+            .collect::<Vec<Page>>();
+
+        // mark as bugged if there are
+        if results.iter().filter(|(_, links)| links.is_none()).count() > 0 {
+            last_query = format!(
+                "UPDATE Pages SET bugged = TRUE WHERE id IN ({});",
+                results
+                    .iter()
+                    .filter(|(_, links)| links.is_none())
+                    .map(|(page, _)| page.id.to_string())
+                    .collect::<Vec<String>>()
+                    .join(", ")
             );
-        } else {
-            child_count += 1;
+            print!("marking bugged pages ");
+            let bugged_result = connection.query_drop(&last_query);
+            if bugged_result.is_err() {
+                eprintln!("\nlast query: {}", last_query);
+                return Err(bugged_result.unwrap_err());
+            }
+            println!("(marked {} pages)", connection.affected_rows());
         }
-    }
 
-    while let Some(child_id) = rx.recv().await {
-        // a child has terminated
-        println!("child {} has terminated", child_id);
-        child_count -= 1;
-
-        let err = spawn_child(main_connection, tx.clone(), url.clone(), child_id);
-        if err.is_err() {
-            eprintln!(
-                "Error failed to spawn child {}: {}",
-                child_id,
-                err.unwrap_err()
+        if found_pages.is_empty() {
+            println!("No links found");
+        } else {
+            // insert new pages
+            last_query = format!(
+                "INSERT INTO Pages (id, url) VALUES {};",
+                found_pages
+                    .iter()
+                    .map(|page| format!("({}, \"{}\")", page.id, page.url))
+                    .collect::<Vec<String>>()
+                    .join(",")
             );
-        } else {
-            child_count += 1;
-        }
+            print!("inserting new pages ");
+            let new_pages_result = connection.query_drop(&last_query);
+            if new_pages_result.is_err() {
+                eprintln!("\nlast query: {}", last_query);
+                return Err(new_pages_result.unwrap_err());
+            }
+            println!("(inserted {} pages)", found_pages.len());
 
-        if child_count >= num_children {
-            continue;
-        }
-        println!("Init child {}", child_count);
-        let err2 = spawn_child(main_connection, tx.clone(), url.clone(), child_count);
-        if err2.is_err() {
-            eprintln!(
-                "Error failed to spawn child {}: {}",
-                child_count,
-                err2.unwrap_err()
+            // transform the results array into an array of relations between pages
+            let relations_found = results
+                .iter()
+                .filter(|(_, links)| links.is_some())
+                .map(|(page, links)| {
+                    links
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .filter(|url| found_pages.iter().any(|page| page.url.eq(*url)))
+                        .map(|url| {
+                            (
+                                page,
+                                found_pages.iter().find(|page| page.url.eq(url)).unwrap(),
+                            )
+                        })
+                        .collect::<Vec<(&Page, &Page)>>()
+                })
+                .flatten()
+                .collect::<Vec<(&Page, &Page)>>();
+
+            // insert the new relations
+            last_query = format!(
+                "INSERT INTO Links (linker, linked) VALUES {}",
+                relations_found
+                    .iter()
+                    .map(|(linker, linked)| format!("({},{})", linker.id, linked.id))
+                    .collect::<Vec<String>>()
+                    .join(", ")
             );
-        } else {
-            child_count += 1;
+            println!("inserting {} relations", relations_found.len());
+            let insert_relations = connection.query_drop(&last_query);
+            if insert_relations.is_err() {
+                eprintln!("\nlast query: {}", last_query);
+                return Err(insert_relations.unwrap_err());
+            }
         }
-    }
 
-    Ok(())
+        // mark as explored
+        last_query = format!(
+            "UPDATE Pages SET explored = TRUE WHERE id IN ({});",
+            results
+                .iter()
+                .map(|(page, _)| page.id.to_string())
+                .collect::<Vec<String>>()
+                .join(", ")
+        );
+        print!("marking pages as explored ");
+        let mark_unexplored_result = connection.query_drop(&last_query);
+        if mark_unexplored_result.is_err() {
+            eprintln!("\nlast query: {}", last_query);
+            return Err(mark_unexplored_result.unwrap_err());
+        }
+        println!("(marked {} pages)", connection.affected_rows());
+    }
+    return Ok(());
 }
 
-fn read_env() -> Result<HashMap<String, String>, Error> {
+fn get_url() -> Result<String, Error> {
     let env_read = std::fs::read_to_string(ENV_PATH);
     if env_read.is_err() {
         let env_write = std::fs::write(ENV_PATH, ENV_DEFAULT);
         if env_write.is_err() {
-            eprintln!(
-                "Error: Couldn't create .env file: {}",
-                env_write.unwrap_err()
-            );
             return Err(Error::from(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "Couldn't create .env file",
+                format!("Couldn't create .env file: {}", env_write.unwrap_err()),
             )));
         }
-        eprintln!(
-            "Error: .env file not found, created a new one with default values:\n{}",
-            ENV_DEFAULT
-        );
         return Err(Error::from(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            ".env file not found, see error message",
+            format!(
+                "Error: .env file not found, created a new one with default values:\n{}",
+                ENV_DEFAULT
+            ),
         )));
     }
 
     let env_content = env_read.unwrap();
     if env_content.is_empty() {
-        eprintln!("Error: .env file is empty, delete it to see default values or fill it with the following values:\n{}", ENV_DEFAULT);
         return Err(Error::from(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            ".env file is empty, see error message",
+            format!("Error: .env file is empty, delete it to see default values or fill it with the following values:\n{}", ENV_DEFAULT),
         )));
     }
 
-    Ok(env_content
+    let vars = env_content
         .split("\n")
         .map(|line| line.split_once("=").unwrap_or(("", "")))
         .map(|(str1, str2)| (str1.split_at(10).1.to_string(), str2.to_string()))
-        .collect::<HashMap<String, String>>())
-}
+        .collect::<HashMap<String, String>>();
 
-fn spawn_child(
-    main_connection: &mut PooledConn,
-    shared_tx: Sender<i32>,
-    shared_url: Arc<RwLock<String>>,
-    child_id: i32,
-) -> Result<(), Error> {
-    let unexplored_result = get_unexplored(main_connection);
-    if unexplored_result.is_err() {
-        return Err(unexplored_result.unwrap_err());
-    }
-    let page = unexplored_result.unwrap();
-
-    let mark_bugged_result = mark_bugged(main_connection, &page);
-    if mark_bugged_result.is_err() {
-        return Err(mark_bugged_result.unwrap_err());
+    if !vars.contains_key("USER")
+        || !vars.contains_key("PASSWORD")
+        || !vars.contains_key("HOST")
+        || !vars.contains_key("PORT")
+    {
+        return Err(Error::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Error: .env file is missing some values, delete it to see default values or fill it with the following values:\n{}", ENV_DEFAULT),
+        )));
     }
 
-    task::spawn(async move {
-        let url = shared_url.read().expect("Unable to read url 1").clone();
-        let pool: &Pool = &Pool::new(url.as_str()).unwrap();
-        let connection = &mut pool.get_conn().unwrap();
-        let result = explore(connection, &page).await;
-        if result.is_err() {
-            // println!("Error: {}", result.unwrap_err());
-        }
-        shared_tx.send(child_id).await.unwrap();
-    });
-
-    Ok(())
+    Ok(format!(
+        "mysql://{}:{}@{}:{}/wikicrawl",
+        vars["USER"], vars["PASSWORD"], vars["HOST"], vars["PORT"]
+    ))
 }
 
-fn get_unexplored(connection: &mut PooledConn) -> Result<Page, Error> {
-    connection
-        .query_first("SELECT Pages.id, Pages.url FROM Unexplored JOIN Pages ON Unexplored.id = Pages.id WHERE Unexplored.bugged = FALSE ORDER BY Pages.id ASC;")
-        .map_or_else(
-            |err| Err(err),
-            |row: Option<Row>| {
-                if row.is_none() {
-                    Err(Error::from(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "Error: No unexplored pages found",
-                    )))
-                } else {
-                    let temp = row.unwrap();
-                    Ok(Page {
-                        id: temp.get(0).unwrap(),
-                        url: temp.get(1).unwrap(),
-                    })
-                }
-            },
-        )
-}
-
-fn mark_bugged(connection: &mut PooledConn, page: &Page) -> Result<(), Error> {
-    connection.exec_drop(
-        "UPDATE Unexplored SET bugged = TRUE WHERE id = :id;",
-        params! {"id" => page.id},
-    )
-}
-
-async fn explore(connection: &mut PooledConn, page: &Page) -> Result<(), Error> {
-    // println!("\nExploring page ({}, \"{}\")", page.id, page.url);
+async fn explore(url: &String) -> Result<Vec<String>, Error> {
     let regex: Regex = Regex::new(r#"['"]/wiki/([a-zA-Z0-9./=_%\-()]*.)['"]"#).unwrap();
 
-    let body = reqwest::get(format!("https://fr.wikipedia.org/wiki/{}", page.url))
+    let body = reqwest::get(format!("https://fr.wikipedia.org/wiki/{}", url))
         .await
-        // .map_err(|err| println!("Error: Couldn't reach page {}: {}", page.url, err))
         .unwrap()
         .text()
         .await;
@@ -214,23 +310,39 @@ async fn explore(connection: &mut PooledConn, page: &Page) -> Result<(), Error> 
         return Err(Error::from(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!(
-                "Error: Couldn't get text of page {}: {}",
-                page.url,
+                "Error: Couldn't get text of page {}:\n{}",
+                url,
                 body.unwrap_err()
             ),
         )));
     }
 
-    let found_links: Vec<String> = regex
+    let found_links = regex
         .captures_iter(body.unwrap().as_str())
         .map(|captures| {
+            let mut first_quote: bool = true;
             decode(captures.get(1).unwrap().as_str())
                 .unwrap()
                 .into_owned()
+                .chars()
+                .map(|c| match c {
+                    '\\' => String::new(),
+                    '"' => {
+                        if first_quote {
+                            first_quote = false;
+                            "«".to_string()
+                        } else {
+                            first_quote = true;
+                            "»".to_string()
+                        }
+                    }
+                    _ => c.to_string(),
+                })
+                .collect::<String>()
         })
-        .collect::<HashSet<_>>()
+        .collect::<HashSet<String>>()
         .into_iter()
-        .collect();
+        .collect::<Vec<String>>();
 
     if found_links.is_empty() {
         return Err(Error::from(std::io::Error::new(
@@ -239,79 +351,5 @@ async fn explore(connection: &mut PooledConn, page: &Page) -> Result<(), Error> 
         )));
     }
 
-    let found_pages: Result<Vec<Page>, Error> = new_pages(connection, &found_links);
-    if found_pages.is_err() {
-        // eprintln!(
-        //     "an Error occured while creating new pages of page ({}, \"{}\"): {}",
-        //     page.id,
-        //     page.url,
-        //     found_pages.as_ref().unwrap_err(),
-        // );
-        return Err(found_pages.unwrap_err());
-    }
-
-    let link_error = new_links(connection, &page, &found_pages.unwrap());
-    if link_error.is_err() {
-        // eprintln!(
-        //     "an Error occured while creating new links of page ({}, \"{}\"): {}",
-        //     page.id,
-        //     page.url,
-        //     link_error.as_ref().unwrap_err()
-        // );
-        return Err(link_error.unwrap_err());
-    }
-
-    let delete_error = connection.exec_drop(
-        "DELETE FROM Unexplored WHERE id = :id;",
-        params! {"id" => page.id},
-    );
-    if delete_error.is_err() {
-        // eprintln!(
-        //     "Error deleting unexplored page (id: {}, url: \"{}\"): {}",
-        //     page.id,
-        //     page.url,
-        //     delete_error.as_ref().unwrap_err()
-        // );
-        return Err(delete_error.unwrap_err());
-    }
-
-    Ok(())
-}
-
-fn new_pages(connection: &mut PooledConn, urls: &Vec<String>) -> Result<Vec<Page>, Error> {
-    // println!("Creating new pages");
-    let insert_query: String = format!(
-        "INSERT IGNORE INTO Pages(url) VALUES (\"{}\");",
-        urls.join("\"), (\"")
-    );
-
-    let select_query: String = format!(
-        "SELECT * FROM Pages WHERE url in (\"{}\");",
-        urls.join("\", \"")
-    );
-
-    let caca: Result<Vec<Page>, Error> = connection.exec_drop(insert_query, ()).map(|_| vec![]);
-    if caca.is_err() {
-        return caca;
-    }
-    connection.query_map(select_query, |(id, url)| Page { id, url })
-}
-
-fn new_links(
-    connection: &mut PooledConn,
-    current_page: &Page,
-    linked_pages: &Vec<Page>,
-) -> Result<(), Error> {
-    // println!("Creating new links");
-    let inserted_values: Vec<String> = linked_pages
-        .into_iter()
-        .map(|page| format!("({}, \"{}\")", current_page.id, page.id))
-        .collect();
-
-    let query = format!(
-        "INSERT IGNORE INTO Links VALUES {};",
-        inserted_values.join(",")
-    );
-
-    connection.exec_drop(query, ())
+    Ok(found_links)
 }
