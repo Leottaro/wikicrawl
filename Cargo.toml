@@ -1,6 +1,6 @@
 [package]
 name = "wikicrawl"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -9,5 +9,7 @@ edition = "2021"
 mysql = "25.0.1"
 regex = "1.10.5"
 urlencoding = "2.1.3"
-reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
+reqwest = "0.12"
+futures = "0.3.30"
+signal-hook = "0.3.17"

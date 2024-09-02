@@ -1,0 +1,37 @@
+DROP TABLE IF EXISTS Links;
+DROP TRIGGER IF EXISTS auto_alias; 
+DROP TABLE IF EXISTS Alias;
+DROP INDEX IF EXISTS page_index ON Pages;
+DROP TABLE IF EXISTS Pages;
+
+CREATE TABLE IF NOT EXISTS Pages (
+  id INT,
+  url VARCHAR(255) CHARACTER SET utf8 COLLATE utf8_bin UNIQUE NOT NULL,
+  explored BOOLEAN DEFAULT false,
+  bugged BOOLEAN DEFAULT false,
+  PRIMARY KEY (id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS page_index ON Pages(id);
+
+CREATE TABLE IF NOT EXISTS Alias (
+  alias VARCHAR(255) CHARACTER SET utf8 COLLATE utf8_bin NOT NULL,
+  id INT NOT NULL,--   PRIMARY KEY (alias, id),
+  FOREIGN KEY (id) REFERENCES Pages(id)
+);
+
+CREATE TRIGGER IF NOT EXISTS auto_alias
+AFTER INSERT ON Pages
+FOR EACH ROW
+BEGIN
+  INSERT INTO Alias (alias, id) VALUES (NEW.url, NEW.id);
+END;
+
+CREATE TABLE IF NOT EXISTS Links (
+  linker INT NOT NULL,
+  linked INT NOT NULL,
+  PRIMARY KEY (linker, linked),
+  FOREIGN KEY (linker) REFERENCES Pages(id),
+  FOREIGN KEY (linked) REFERENCES Pages(id)
+);
+
+INSERT INTO Pages (id, url) VALUES (1095, "France");
