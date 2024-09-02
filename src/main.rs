@@ -2,10 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use mysql::prelude::*;
 use mysql::*;
-use regex::Regex;
+use regex::{Match, Regex};
 use signal_hook::consts::SIGINT;
 use signal_hook::iterator::Signals;
 use tokio::task;
@@ -13,9 +14,9 @@ use urlencoding::decode;
 
 const ENV_PATH: &str = ".env";
 const ENV_DEFAULT: &str =
-    "WIKICRAWL_USER=root\nWIKICRAWL_PASSWORD=root\nWIKICRAWL_HOST=localhost\nWIKICRAWL_PORT=3306\nWIKICRAWL_CONCURRENT_PAGES=200";
+    "WIKICRAWL_USER=root\nWIKICRAWL_PASSWORD=root\nWIKICRAWL_HOST=localhost\nWIKICRAWL_PORT=3306\nWIKICRAWL_CONCURRENT_PAGES=200\nWIKICRAWL_CHUNK_SIZE=200\n";
 
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 struct Page {
     id: usize,
     url: String,
@@ -23,8 +24,8 @@ struct Page {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let (url, max_concurrent_pages) = get_env().unwrap();
-    let pool = Pool::new(url.as_str()).unwrap();
+    let (database_url, max_concurrent_pages, chunk_size) = get_env().unwrap();
+    let pool = Pool::new(database_url.clone().as_str()).unwrap();
     let mut connection = pool.get_conn().unwrap();
 
     let shared_bool = Arc::new(Mutex::new(true));
@@ -49,16 +50,6 @@ async fn main() -> Result<(), Error> {
 
     let mut last_query: String;
     while *shared_bool_clone.lock().unwrap() {
-        // get greatest page id
-        last_query = "SELECT MAX(id) FROM Pages;".to_string();
-        println!("getting greatest page id");
-        let greatest_id_result: Result<Option<usize>, Error> = connection.query_first(&last_query);
-        if greatest_id_result.is_err() {
-            eprintln!("\nlast query: {}", last_query);
-            return Err(greatest_id_result.unwrap_err());
-        }
-        let greatest_id = greatest_id_result.unwrap().unwrap_or(0);
-
         // get unexplored pages
         last_query = format!(
             "SELECT id, url FROM Pages WHERE explored = false ORDER BY id ASC LIMIT {};",
@@ -79,7 +70,6 @@ async fn main() -> Result<(), Error> {
                 "No unexplored pages found",
             )));
         }
-
         println!(
             "Exploring pages: {}",
             unexplored_pages
@@ -89,37 +79,34 @@ async fn main() -> Result<(), Error> {
                 .join(", ")
         );
 
-        let pages: Arc<Mutex<Vec<(Page, Option<Vec<String>>)>>> = Arc::new(Mutex::new(Vec::new()));
-        let mut children: Vec<task::JoinHandle<()>> = Vec::new();
+        let mut results: Vec<(Page, Vec<String>)> = Vec::new();
+        let mut bugged_pages: Vec<Page> = Vec::new();
+        let mut children: Vec<task::JoinHandle<(Page, Option<Vec<String>>)>> = Vec::new();
 
         println!("spawning threads");
 
         unexplored_pages.into_iter().for_each(|page| {
-            let shared_pages = Arc::clone(&pages);
-            children.push(task::spawn(async move {
+            let child = task::spawn(async move {
                 let explore_result = explore(&page.url).await;
-                let mut thread_pages = shared_pages.lock().unwrap();
-                if explore_result.is_ok() {
-                    thread_pages.push((page, Some(explore_result.unwrap())));
-                } else {
-                    thread_pages.push((page, None));
-                }
                 print!(
-                    "\rwaiting for threads to finish {}/{} ({}%)                                ",
-                    thread_pages.len(),
-                    max_concurrent_pages,
-                    thread_pages.len() * 100 / max_concurrent_pages
+                    "waiting for threads to finish 0/{} (0%)\t\r",
+                    max_concurrent_pages
                 );
                 std::io::stdout().flush().unwrap();
-            }));
+                if explore_result.is_err() {
+                    (page, None)
+                } else {
+                    (page, Some(explore_result.unwrap()))
+                }
+            });
+            children.push(child);
         });
 
         print!(
-            "waiting for threads to finish 0/{} (0%)",
+            "waiting for threads to finish 0/{} (0%)\t\r",
             max_concurrent_pages
         );
         std::io::stdout().flush().unwrap();
-
         for child in children.into_iter() {
             let child_result = child.await;
             if child_result.is_err() {
@@ -128,39 +115,24 @@ async fn main() -> Result<(), Error> {
                     child_result.unwrap_err(),
                 )));
             }
-            child_result.unwrap();
+            let (page, links) = child_result.unwrap();
+            if links.is_none() {
+                bugged_pages.push(page);
+            } else {
+                results.push((page, links.unwrap()));
+            }
         }
-
         println!("\rthreads finished                                ");
 
-        let results = pages.lock().unwrap();
-        let found_links = results
-            .iter()
-            .filter_map(|(_, links)| links.as_ref())
-            .flatten()
-            .collect::<HashSet<&String>>();
-        let found_pages = found_links
-            .into_iter()
-            .enumerate()
-            .map(|(id, url)| Page {
-                id: greatest_id + id + 1,
-                url: url.clone(),
-            })
-            .collect::<Vec<Page>>();
-
         // mark as bugged if there are
-        if results.iter().filter(|(_, links)| links.is_none()).count() > 0 {
+        if bugged_pages.len() > 0 {
             last_query = format!(
                 "UPDATE Pages SET bugged = TRUE WHERE id IN ({});",
-                results
+                bugged_pages
                     .iter()
-                    .filter_map(|(page, links)| if links.is_none() {
-                        Some(page.id.to_string())
-                    } else {
-                        None
-                    })
+                    .map(|page| page.id.to_string())
                     .collect::<Vec<String>>()
-                    .join(", ")
+                    .join(",")
             );
             print!("marking bugged pages ");
             std::io::stdout().flush().unwrap();
@@ -172,15 +144,82 @@ async fn main() -> Result<(), Error> {
             println!("({} pages)", connection.affected_rows());
         }
 
+        let found_links = results
+            .iter()
+            .map(|(_, links)| links)
+            .flatten()
+            .collect::<HashSet<&String>>();
+        println!("found {} links", found_links.len());
+
+        let now = Instant::now();
+        last_query = format!(
+			"SELECT Alias.alias, Pages.id, Pages.url FROM Pages JOIN Alias ON Pages.id = Alias.id WHERE alias IN ({});", 
+			found_links
+				.iter()
+				.map(|link| format!("\"{}\"", link))
+				.collect::<Vec<String>>()
+				.join(", "));
+        let mut found_pages = connection
+            .query_map(last_query, |(alias, id, url): (String, usize, String)| {
+                (alias, Page { id, url })
+            })
+            .unwrap()
+            .into_iter()
+            .collect::<HashMap<String, Page>>();
+        print!(
+            "found {} pages ({}ms)      \r",
+            found_pages.len(),
+            now.elapsed().as_millis()
+        );
+
+        for chunk in found_links
+            .into_iter()
+            .filter(|link| !found_pages.contains_key(link.to_owned()))
+            .collect::<Vec<&String>>()
+            .chunks(chunk_size)
+        {
+            let now = Instant::now();
+            let new_pages_futures = chunk.into_iter().map(|link| async move {
+                (link.to_string(), extract_link_info(link.to_string()).await)
+            });
+            let new_pages = futures::future::join_all(new_pages_futures).await;
+            found_pages.extend(new_pages);
+            print!(
+                "found {} pages ({}ms)      \r",
+                found_pages.len(),
+                now.elapsed().as_millis()
+            );
+            std::io::stdout().flush().unwrap();
+        }
+        println!("found {} pages            ", found_pages.len());
+
         if found_pages.is_empty() {
             println!("No links found");
         } else {
-            // insert new pages
+            // insert new aliases
             last_query = format!(
-                "INSERT INTO Pages (id, url) VALUES {};",
+                "INSERT IGNORE INTO Alias (alias, id) VALUES {};",
                 found_pages
                     .iter()
-                    .map(|page| format!("({}, \"{}\")", page.id, page.url))
+                    .map(|(alias, page)| format!("(\"{}\", {})", alias, page.id))
+                    .collect::<Vec<String>>()
+                    .join(",")
+            );
+            print!("inserting new aliases");
+            std::io::stdout().flush().unwrap();
+            let new_alias_result = connection.query_drop(&last_query);
+            if new_alias_result.is_err() {
+                eprintln!("\nlast query: {}", last_query);
+                return Err(new_alias_result.unwrap_err());
+            }
+            println!("({} pages)", found_pages.len());
+
+            // insert new pages
+            last_query = format!(
+                "INSERT IGNORE INTO Pages (id, url) VALUES {};",
+                found_pages
+                    .iter()
+                    .map(|(_, page)| format!("({}, \"{}\")", page.id, page.url))
                     .collect::<Vec<String>>()
                     .join(",")
             );
@@ -197,29 +236,20 @@ async fn main() -> Result<(), Error> {
             print!("generating relations ");
             std::io::stdout().flush().unwrap();
 
-            // create a HashMap for faster lookup of found_pages
-            let found_pages_map: HashMap<String, &Page> = found_pages
-                .iter()
-                .map(|page| (page.url.clone(), page))
-                .collect();
-
             let relations_found = results
                 .iter()
-                .filter_map(|(page, links)| {
-                    if links.is_none() {
-                        None
-                    } else {
-                        Some(
-                            links
-                                .as_ref()
-                                .unwrap()
-                                .iter()
-                                .filter_map(|url| {
-                                    found_pages_map.get(url).map(|linked| (page, *linked))
-                                })
-                                .collect::<Vec<(&Page, &Page)>>(),
-                        )
-                    }
+                .map(|(page, links)| {
+                    links
+                        .iter()
+                        .filter_map(|url| {
+                            let linked = found_pages.get(url);
+                            if linked.is_none() {
+                                None
+                            } else {
+                                Some((page, linked.unwrap()))
+                            }
+                        })
+                        .collect::<HashSet<(&Page, &Page)>>()
                 })
                 .flatten()
                 .collect::<Vec<(&Page, &Page)>>();
@@ -227,7 +257,7 @@ async fn main() -> Result<(), Error> {
 
             // insert the new relations
             last_query = format!(
-                "INSERT INTO Links (linker, linked) VALUES {}",
+                "INSERT INTO Links (linker, linked) VALUES {};",
                 relations_found
                     .iter()
                     .map(|(linker, linked)| format!("({},{})", linker.id, linked.id))
@@ -292,7 +322,7 @@ async fn main() -> Result<(), Error> {
     return Ok(());
 }
 
-fn get_env() -> Result<(String, usize), Error> {
+fn get_env() -> Result<(String, usize, usize), Error> {
     let env_read = std::fs::read_to_string(ENV_PATH);
     if env_read.is_err() {
         let env_write = std::fs::write(ENV_PATH, ENV_DEFAULT);
@@ -329,6 +359,8 @@ fn get_env() -> Result<(String, usize), Error> {
         || !vars.contains_key("PASSWORD")
         || !vars.contains_key("HOST")
         || !vars.contains_key("PORT")
+        || !vars.contains_key("CONCURRENT_PAGES")
+        || !vars.contains_key("CHUNK_SIZE")
     {
         return Err(Error::from(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -341,14 +373,22 @@ fn get_env() -> Result<(String, usize), Error> {
             "mysql://{}:{}@{}:{}/wikicrawl",
             vars["USER"], vars["PASSWORD"], vars["HOST"], vars["PORT"]
         ),
-        vars["CONCURRENT_PAGES"].parse::<usize>().unwrap_or(200),
+        vars["CONCURRENT_PAGES"].parse::<usize>().unwrap_or(100),
+        vars["CHUNK_SIZE"].parse::<usize>().unwrap_or(200),
     ))
 }
 
 async fn explore(url: &String) -> Result<Vec<String>, Error> {
     let regex: Regex = Regex::new(r#"['"]/wiki/([a-zA-Z0-9./=_%\-()]*.)['"]"#).unwrap();
 
-    let body = reqwest::get(format!("https://fr.m.wikipedia.org/wiki/{}", url))
+    let client = reqwest::Client::builder()
+		.user_agent("Mozilla/5.0 (X11; Linux i686) AppleWebKit/537.17 (KHTML, like Gecko) Chrome/24.0.1312.27 Safari/537.17")
+		.build()
+		.unwrap();
+
+    let body = client
+        .get(format!("https://fr.m.wikipedia.org/wiki/{}", url))
+        .send()
         .await
         .unwrap()
         .text()
@@ -384,7 +424,7 @@ async fn explore(url: &String) -> Result<Vec<String>, Error> {
                             "»".to_string()
                         }
                     }
-                    _ => c.to_string(),
+                    _ => c.to_lowercase().to_string(),
                 })
                 .collect::<String>()
         })
@@ -400,4 +440,36 @@ async fn explore(url: &String) -> Result<Vec<String>, Error> {
     }
 
     Ok(found_links)
+}
+
+async fn extract_link_info(url: String) -> Page {
+    let regex = Regex::new(r#"(?m)"?(?:(?:wgArticleId)|(?:wgPageName))"?:\n?"?(.*?)"?,"#).unwrap();
+
+    loop {
+        let body = reqwest::get(format!(
+            "https://fr.m.wikipedia.org/wiki/Sp%C3%A9cial:Recherche/{}",
+            url
+        ))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+        .replace("\n", "");
+
+        let captures = regex
+            .captures_iter(body.as_str())
+            .map(|capture| capture.get(1).unwrap())
+            .collect::<Vec<Match>>();
+        let found_url = captures.get(0).map(|content| content.as_str());
+        let found_id = captures.get(1).map(|content| content.as_str());
+        if found_url.is_some() && found_id.is_some() {
+            return Page {
+                url: found_url.unwrap().to_string(),
+                id: found_id.unwrap().parse::<usize>().unwrap(),
+            };
+        }
+        println!("\nretrying {}", url);
+        thread::sleep(Duration::from_secs(1));
+    }
 }
