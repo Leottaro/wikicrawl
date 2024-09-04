@@ -15,16 +15,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS page_index ON Pages(id);
 
 CREATE TABLE IF NOT EXISTS Alias (
   alias VARCHAR(255) CHARACTER SET utf8 COLLATE utf8_bin NOT NULL,
-  id INT NOT NULL,--   PRIMARY KEY (alias, id),
+  id INT NOT NULL,
+  PRIMARY KEY (alias, id),
   FOREIGN KEY (id) REFERENCES Pages(id)
 );
 
 CREATE TRIGGER IF NOT EXISTS auto_alias
 AFTER INSERT ON Pages
 FOR EACH ROW
-BEGIN
-  INSERT INTO Alias (alias, id) VALUES (NEW.url, NEW.id);
-END;
+INSERT INTO Alias (alias, id) VALUES (NEW.url, NEW.id);
 
 CREATE TABLE IF NOT EXISTS Links (
   linker INT NOT NULL,

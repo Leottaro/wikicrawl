@@ -14,7 +14,20 @@ use urlencoding::decode;
 
 const ENV_PATH: &str = ".env";
 const ENV_DEFAULT: &str =
-    "WIKICRAWL_USER=root\nWIKICRAWL_PASSWORD=root\nWIKICRAWL_HOST=localhost\nWIKICRAWL_PORT=3306\nWIKICRAWL_CONCURRENT_PAGES=200\nWIKICRAWL_CHUNK_SIZE=200\n";
+    "WIKICRAWL_USER=root\nWIKICRAWL_PASSWORD=root\nWIKICRAWL_HOST=localhost\nWIKICRAWL_PORT=3306\nWIKICRAWL_CONCURRENT_PAGES=10\nWIKICRAWL_CHUNK_SIZE=200\n";
+const IMPOSSIBLE_PAGES: [&str; 10] = [
+    "fichier:",
+    "projet:",
+    "portail:",
+    "aide:",
+    "spécial:",
+    "référence:",
+    "modèle:",
+    "catégorie:",
+    "discussion:",
+    "wikipédia:",
+];
+const RETRY_COOLDOWN: u64 = 1;
 
 #[derive(Debug, Hash, PartialEq, Eq)]
 struct Page {
@@ -52,7 +65,7 @@ async fn main() -> Result<(), Error> {
     while *shared_bool_clone.lock().unwrap() {
         // get unexplored pages
         last_query = format!(
-            "SELECT id, url FROM Pages WHERE explored = false ORDER BY id ASC LIMIT {};",
+            "SELECT id, url FROM Pages WHERE explored = false AND bugged = false ORDER BY id ASC LIMIT {};",
             max_concurrent_pages
         );
         println!("getting unexplored pages");
@@ -93,10 +106,9 @@ async fn main() -> Result<(), Error> {
                     max_concurrent_pages
                 );
                 std::io::stdout().flush().unwrap();
-                if explore_result.is_err() {
-                    (page, None)
-                } else {
-                    (page, Some(explore_result.unwrap()))
+                match explore_result {
+                    Ok(links) => (page, Some(links)),
+                    Err(_) => (page, None),
                 }
             });
             children.push(child);
@@ -116,10 +128,9 @@ async fn main() -> Result<(), Error> {
                 )));
             }
             let (page, links) = child_result.unwrap();
-            if links.is_none() {
-                bugged_pages.push(page);
-            } else {
-                results.push((page, links.unwrap()));
+            match links {
+                Some(links) => results.push((page, links)),
+                None => bugged_pages.push(page),
             }
         }
         println!("\rthreads finished                                ");
@@ -172,6 +183,7 @@ async fn main() -> Result<(), Error> {
             now.elapsed().as_millis()
         );
 
+        let mut total_elapsed: u128 = 0;
         for chunk in found_links
             .into_iter()
             .filter(|link| !found_pages.contains_key(link.to_owned()))
@@ -179,19 +191,27 @@ async fn main() -> Result<(), Error> {
             .chunks(chunk_size)
         {
             let now = Instant::now();
-            let new_pages_futures = chunk.into_iter().map(|link| async move {
-                (link.to_string(), extract_link_info(link.to_string()).await)
+            let new_pages_children = chunk.into_iter().map(|link| {
+                let owned_link = link.to_string();
+                task::spawn(
+                    async move { (owned_link.clone(), extract_link_info_api(owned_link).await) },
+                )
             });
-            let new_pages = futures::future::join_all(new_pages_futures).await;
-            found_pages.extend(new_pages);
-            print!(
-                "found {} pages ({}ms)      \r",
-                found_pages.len(),
-                now.elapsed().as_millis()
-            );
+            let new_pages = new_pages_children
+                .into_iter()
+                .map(|child| async move { child.await.unwrap() });
+            found_pages.extend(futures::future::join_all(new_pages).await);
+
+            let elapsed = now.elapsed().as_millis();
+            total_elapsed += elapsed;
+            print!("found {} pages ({}ms)      \r", found_pages.len(), elapsed);
             std::io::stdout().flush().unwrap();
         }
-        println!("found {} pages            ", found_pages.len());
+        println!(
+            "found {} pages ({}ms)     ",
+            found_pages.len(),
+            total_elapsed
+        );
 
         if found_pages.is_empty() {
             println!("No links found");
@@ -243,21 +263,17 @@ async fn main() -> Result<(), Error> {
                         .iter()
                         .filter_map(|url| {
                             let linked = found_pages.get(url);
-                            if linked.is_none() {
-                                None
-                            } else {
-                                Some((page, linked.unwrap()))
-                            }
+                            linked.map(|link| (page, link))
                         })
                         .collect::<HashSet<(&Page, &Page)>>()
                 })
                 .flatten()
-                .collect::<Vec<(&Page, &Page)>>();
+                .collect::<HashSet<(&Page, &Page)>>();
             println!("({} relations)", relations_found.len());
 
             // insert the new relations
             last_query = format!(
-                "INSERT INTO Links (linker, linked) VALUES {};",
+                "INSERT IGNORE INTO Links (linker, linked) VALUES {};",
                 relations_found
                     .iter()
                     .map(|(linker, linked)| format!("({},{})", linker.id, linked.id))
@@ -379,16 +395,9 @@ fn get_env() -> Result<(String, usize, usize), Error> {
 }
 
 async fn explore(url: &String) -> Result<Vec<String>, Error> {
-    let regex: Regex = Regex::new(r#"['"]/wiki/([a-zA-Z0-9./=_%\-()]*.)['"]"#).unwrap();
+    let regex = Regex::new(r#"(?m)"\/wiki\/([^"\/]+)""#).unwrap();
 
-    let client = reqwest::Client::builder()
-		.user_agent("Mozilla/5.0 (X11; Linux i686) AppleWebKit/537.17 (KHTML, like Gecko) Chrome/24.0.1312.27 Safari/537.17")
-		.build()
-		.unwrap();
-
-    let body = client
-        .get(format!("https://fr.m.wikipedia.org/wiki/{}", url))
-        .send()
+    let body = reqwest::get(format!("https://fr.m.wikipedia.org/wiki/{}", url))
         .await
         .unwrap()
         .text()
@@ -424,6 +433,7 @@ async fn explore(url: &String) -> Result<Vec<String>, Error> {
                             "»".to_string()
                         }
                     }
+                    '?' => "%3F".to_string(),
                     _ => c.to_lowercase().to_string(),
                 })
                 .collect::<String>()
@@ -432,22 +442,70 @@ async fn explore(url: &String) -> Result<Vec<String>, Error> {
         .into_iter()
         .collect::<Vec<String>>();
 
-    if found_links.is_empty() {
+    let filtered_links = found_links
+        .into_iter()
+        .filter(|link| {
+            !IMPOSSIBLE_PAGES
+                .iter()
+                .any(|impossible| link.to_ascii_lowercase().starts_with(impossible))
+        })
+        .collect::<Vec<String>>();
+
+    if filtered_links.is_empty() {
         return Err(Error::from(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "No links found",
         )));
     }
 
-    Ok(found_links)
+    Ok(filtered_links)
 }
 
-async fn extract_link_info(url: String) -> Page {
+async fn extract_link_info_api(url: String) -> Page {
+    let regex = Regex::new(r#"(?mU),"title":"(.+)","pageid":(.+),"size""#).unwrap();
+    let mut loop_count = 0;
+
+    while loop_count < 3 {
+        let body = reqwest::get(format!(
+            "https://fr.m.wikipedia.org/w/api.php?action=query&format=json&list=search&utf8=1&formatversion=2&srnamespace=0&srlimit=1&srsearch={}",
+            url
+        ))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+        .replace("\n", "");
+
+        let captures = regex.captures(body.as_str());
+        match captures {
+            Some(capture) => {
+                return Page {
+                    url: capture.get(1).unwrap().as_str().to_string(),
+                    id: capture.get(2).unwrap().as_str().parse::<usize>().unwrap(),
+                };
+            }
+            None => {
+                if !body.starts_with("{\"batchcomplete\":true,\"continue\"") {
+                    loop_count += 1;
+                    thread::sleep(Duration::from_secs(RETRY_COOLDOWN));
+                    continue;
+                } else {
+                    println!("API couldn't find {}: \n{}", url, body);
+                    loop_count = 3;
+                }
+            }
+        }
+    }
+    extract_link_info_web(url).await
+}
+
+async fn extract_link_info_web(url: String) -> Page {
     let regex = Regex::new(r#"(?m)"?(?:(?:wgArticleId)|(?:wgPageName))"?:\n?"?(.*?)"?,"#).unwrap();
 
     loop {
         let body = reqwest::get(format!(
-            "https://fr.m.wikipedia.org/wiki/Sp%C3%A9cial:Recherche/{}",
+            "https://fr.m.wikipedia.org/wiki/Spécial:Recherche/{}",
             url
         ))
         .await
@@ -469,7 +527,6 @@ async fn extract_link_info(url: String) -> Page {
                 id: found_id.unwrap().parse::<usize>().unwrap(),
             };
         }
-        println!("\nretrying {}", url);
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_secs(RETRY_COOLDOWN));
     }
 }
