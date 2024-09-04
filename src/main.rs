@@ -221,7 +221,11 @@ async fn main() -> Result<(), Error> {
                 "INSERT IGNORE INTO Alias (alias, id) VALUES {};",
                 found_pages
                     .iter()
-                    .map(|(alias, page)| format!("(\"{}\", {})", alias, page.id))
+                    .map(|(alias, page)| format!(
+                        "(\"{}\", {})",
+                        alias.replace("\"", "\"\""),
+                        page.id
+                    ))
                     .collect::<Vec<String>>()
                     .join(",")
             );
@@ -239,7 +243,11 @@ async fn main() -> Result<(), Error> {
                 "INSERT IGNORE INTO Pages (id, url) VALUES {};",
                 found_pages
                     .iter()
-                    .map(|(_, page)| format!("({}, \"{}\")", page.id, page.url))
+                    .map(|(_, page)| format!(
+                        "({}, \"{}\")",
+                        page.id,
+                        page.url.replace("\"", "\"\"")
+                    ))
                     .collect::<Vec<String>>()
                     .join(",")
             );
