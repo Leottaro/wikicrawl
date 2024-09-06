@@ -15,17 +15,35 @@ use urlencoding::decode;
 const ENV_PATH: &str = ".env";
 const ENV_DEFAULT: &str =
     "WIKICRAWL_USER=root\nWIKICRAWL_PASSWORD=root\nWIKICRAWL_HOST=localhost\nWIKICRAWL_PORT=3306\nWIKICRAWL_CONCURRENT_PAGES=10\nWIKICRAWL_CHUNK_SIZE=200\n";
-const IMPOSSIBLE_PAGES: [&str; 10] = [
-    "fichier:",
-    "projet:",
-    "portail:",
-    "aide:",
-    "spécial:",
-    "référence:",
-    "modèle:",
-    "catégorie:",
-    "discussion:",
-    "wikipédia:",
+const WIKIPEDIA_NAMESPACES: [&str; 28] = [
+    "média",
+    "spécial",
+    "discussion",
+    "utilisateur",
+    "discussion_utilisateur",
+    "wikipédia",
+    "discussion_wikipédia",
+    "fichier",
+    "discussion_fichier",
+    "mediawiki",
+    "discussion_mediawiki",
+    "modèle",
+    "discussion_modèle",
+    "aide",
+    "discussion_aide",
+    "catégorie",
+    "discussion_catégorie",
+    "portail",
+    "discussion_portail",
+    "projet",
+    "discussion_projet",
+    "référence",
+    "discussion_référence",
+    "timedtext",
+    "timedtext_talk",
+    "module",
+    "discussion_module",
+    "sujet",
 ];
 const RETRY_COOLDOWN: u64 = 1;
 
@@ -167,21 +185,28 @@ async fn main() -> Result<(), Error> {
 			"SELECT Alias.alias, Pages.id, Pages.url FROM Pages JOIN Alias ON Pages.id = Alias.id WHERE alias IN ({});", 
 			found_links
 				.iter()
-				.map(|link| format!("\"{}\"", link))
+				.map(|link| format!("\"{}\"", format_link_for_query(link)))
 				.collect::<Vec<String>>()
 				.join(", "));
-        let mut found_pages = connection
-            .query_map(last_query, |(alias, id, url): (String, usize, String)| {
+        let found_pages_result = connection
+            .query_map(&last_query, |(alias, id, url): (String, usize, String)| {
                 (alias, Page { id, url })
-            })
+            });
+        if found_pages_result.is_err() {
+            eprintln!("\nlast query: {}", last_query);
+            return Err(found_pages_result.unwrap_err());
+        }
+        let mut found_pages = found_pages_result
             .unwrap()
             .into_iter()
             .collect::<HashMap<String, Page>>();
+
         print!(
             "found {} pages ({}ms)      \r",
             found_pages.len(),
             now.elapsed().as_millis()
         );
+        std::io::stdout().flush().unwrap();
 
         let mut total_elapsed: u128 = 0;
         for chunk in found_links
@@ -223,20 +248,20 @@ async fn main() -> Result<(), Error> {
                     .iter()
                     .map(|(alias, page)| format!(
                         "(\"{}\", {})",
-                        alias.replace("\"", "\"\""),
+                        format_link_for_query(alias),
                         page.id
                     ))
                     .collect::<Vec<String>>()
                     .join(",")
             );
-            print!("inserting new aliases");
+            print!("inserting new aliases ");
             std::io::stdout().flush().unwrap();
             let new_alias_result = connection.query_drop(&last_query);
             if new_alias_result.is_err() {
                 eprintln!("\nlast query: {}", last_query);
                 return Err(new_alias_result.unwrap_err());
             }
-            println!("({} pages)", found_pages.len());
+            println!("({} pages)", connection.affected_rows());
 
             // insert new pages
             last_query = format!(
@@ -246,7 +271,7 @@ async fn main() -> Result<(), Error> {
                     .map(|(_, page)| format!(
                         "({}, \"{}\")",
                         page.id,
-                        page.url.replace("\"", "\"\"")
+                        format_link_for_query(&page.url)
                     ))
                     .collect::<Vec<String>>()
                     .join(",")
@@ -258,7 +283,7 @@ async fn main() -> Result<(), Error> {
                 eprintln!("\nlast query: {}", last_query);
                 return Err(new_pages_result.unwrap_err());
             }
-            println!("({} pages)", found_pages.len());
+            println!("({} pages)", connection.affected_rows());
 
             // transform the results array into an array of relations between pages
             print!("generating relations ");
@@ -288,29 +313,24 @@ async fn main() -> Result<(), Error> {
                     .collect::<Vec<String>>()
                     .join(", ")
             );
-            println!("inserting the relations");
+            print!("inserting the relations ");
+            std::io::stdout().flush().unwrap();
             let insert_relations = connection.query_drop(&last_query);
             if insert_relations.is_err() {
                 eprintln!("\nlast query: {}", last_query);
                 return Err(insert_relations.unwrap_err());
             }
+            println!("({} relations)", connection.affected_rows());
         }
 
         // mark as explored
         last_query = format!(
-            "UPDATE Pages SET explored = TRUE WHERE id BETWEEN {} AND {};",
+            "UPDATE Pages SET explored = TRUE WHERE id IN ({});",
             results
                 .iter()
-                .min_by(|x, y| x.0.id.cmp(&y.0.id))
-                .unwrap()
-                .0
-                .id,
-            results
-                .iter()
-                .max_by(|x, y| x.0.id.cmp(&y.0.id))
-                .unwrap()
-                .0
-                .id
+                .map(|(page, _)| page.id.to_string())
+                .collect::<Vec<String>>()
+                .join(", ")
         );
         print!("marking pages as explored ");
         std::io::stdout().flush().unwrap();
@@ -425,22 +445,11 @@ async fn explore(url: &String) -> Result<Vec<String>, Error> {
     let found_links = regex
         .captures_iter(body.unwrap().as_str())
         .map(|captures| {
-            let mut first_quote: bool = true;
             decode(captures.get(1).unwrap().as_str())
                 .unwrap()
                 .into_owned()
                 .chars()
                 .map(|c| match c {
-                    '\\' => String::new(),
-                    '"' => {
-                        if first_quote {
-                            first_quote = false;
-                            "«".to_string()
-                        } else {
-                            first_quote = true;
-                            "»".to_string()
-                        }
-                    }
                     '?' => "%3F".to_string(),
                     _ => c.to_lowercase().to_string(),
                 })
@@ -453,7 +462,7 @@ async fn explore(url: &String) -> Result<Vec<String>, Error> {
     let filtered_links = found_links
         .into_iter()
         .filter(|link| {
-            !IMPOSSIBLE_PAGES
+            !WIKIPEDIA_NAMESPACES
                 .iter()
                 .any(|impossible| link.to_ascii_lowercase().starts_with(impossible))
         })
@@ -537,4 +546,14 @@ async fn extract_link_info_web(url: String) -> Page {
         }
         thread::sleep(Duration::from_secs(RETRY_COOLDOWN));
     }
+}
+
+fn format_link_for_query(link: &String) -> String {
+    link.chars()
+        .map(|c| match c {
+            '\\' => "\\\\".to_string(),
+            '\"' => "\"\"".to_string(),
+            _ => c.to_string(),
+        })
+        .collect()
 }
