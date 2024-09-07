@@ -1,10 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::io::Write;
 use std::ops::AddAssign;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::Local;
+use env_logger::Builder;
+use log::{error, info, LevelFilter};
 use mysql::prelude::*;
 use mysql::*;
 use regex::{Match, Regex};
@@ -56,7 +60,15 @@ struct Page {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let (database_url, max_concurrent_pages, chunk_size) = get_env().unwrap();
+    setup_logs()?;
+
+    let env_result = get_env();
+    if env_result.is_err() {
+        error_and_log(&format!("{}", env_result.as_ref().unwrap_err()));
+        return Err(env_result.unwrap_err());
+    }
+    let (database_url, max_concurrent_pages, chunk_size) = env_result.unwrap();
+
     let pool = Pool::new(database_url.clone().as_str()).unwrap();
     let mut connection = pool.get_conn().unwrap();
 
@@ -71,10 +83,10 @@ async fn main() -> Result<(), Error> {
 
             let mut val = shared_bool.lock().unwrap();
             if *val {
-                println!("\nSIGINT received, waiting for the program to stop");
+                println_and_log("SIGINT received, waiting for the program to stop");
                 *val = false;
             } else {
-                println!("\nSIGINT received again, forcing the program to stop");
+                println_and_log("SIGINT received again, forcing the program to stop");
                 std::process::exit(0);
             }
         }
@@ -87,35 +99,35 @@ async fn main() -> Result<(), Error> {
             "SELECT id, url FROM Pages WHERE explored = false AND bugged = false ORDER BY id ASC LIMIT {};",
             max_concurrent_pages
         );
-        println!("getting unexplored pages");
+        println_and_log("getting unexplored pages");
         let unexplored_result = connection.query_map(&last_query, |(id, url)| Page { id, url });
         if unexplored_result.is_err() {
-            eprintln!("\nlast query: {}", last_query);
+            error_and_log(&format!("\nlast query: {}", last_query));
             return Err(unexplored_result.unwrap_err());
         }
         let unexplored_pages = unexplored_result.unwrap();
         let unexplored_length = unexplored_pages.len();
         if unexplored_length < 1 {
-            eprintln!("\nlast query: {}", last_query);
+            error_and_log(&format!("\nlast query: {}", last_query));
             return Err(Error::from(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "No unexplored pages found",
             )));
         }
-        println!(
+        println_and_log(&format!(
             "Exploring pages: {}",
             unexplored_pages
                 .iter()
                 .map(|page| format!("\"{}\"", page.url))
                 .collect::<Vec<String>>()
                 .join(", ")
-        );
+        ));
 
         let mut results: Vec<(Page, Vec<String>)> = Vec::new();
         let mut bugged_pages: Vec<Page> = Vec::new();
         let mut children: Vec<task::JoinHandle<(Page, Option<Vec<String>>)>> = Vec::new();
 
-        println!("spawning threads");
+        println_and_log(&format!("spawning threads"));
 
         unexplored_pages.into_iter().for_each(|page| {
             let child = task::spawn(async move {
@@ -152,7 +164,9 @@ async fn main() -> Result<(), Error> {
                 None => bugged_pages.push(page),
             }
         }
-        println!("\rthreads finished                                ");
+        println_and_log(&format!(
+            "\rthreads finished                                "
+        ));
 
         // mark as bugged if there are
         if bugged_pages.len() > 0 {
@@ -165,13 +179,14 @@ async fn main() -> Result<(), Error> {
                     .join(",")
             );
             print!("marking bugged pages ");
+            info!("marking bugged pages ");
             std::io::stdout().flush().unwrap();
             let bugged_result = connection.query_drop(&last_query);
             if bugged_result.is_err() {
-                eprintln!("\nlast query: {}", last_query);
+                error_and_log(&format!("\nlast query: {}", last_query));
                 return Err(bugged_result.unwrap_err());
             }
-            println!("({} pages)", connection.affected_rows());
+            println_and_log(&format!("({} pages)", connection.affected_rows()));
         }
 
         let found_links = results
@@ -179,7 +194,7 @@ async fn main() -> Result<(), Error> {
             .map(|(_, links)| links.clone())
             .flatten()
             .collect::<HashSet<String>>();
-        println!("found {} links", found_links.len());
+        println_and_log(&format!("found {} links", found_links.len()));
 
         let now = Instant::now();
         last_query = format!(
@@ -194,7 +209,7 @@ async fn main() -> Result<(), Error> {
                 (alias, Page { id, url })
             });
         if found_pages_result.is_err() {
-            eprintln!("\nlast query: {}", last_query);
+            error_and_log(&format!("\nlast query: {}", last_query));
             return Err(found_pages_result.unwrap_err());
         }
         let mut found_pages = found_pages_result
@@ -250,14 +265,14 @@ async fn main() -> Result<(), Error> {
             .flatten()
             .collect::<Vec<(String, Page)>>();
         found_pages.extend(new_pages);
-        println!(
+        println_and_log(&format!(
             "found {} pages ({}ms)      ",
             found_pages.len(),
             shared_now.lock().unwrap().elapsed().as_millis()
-        );
+        ));
 
         if found_pages.is_empty() {
-            println!("No links found");
+            println_and_log(&format!("No links found"));
         } else {
             // insert new aliases
             last_query = format!(
@@ -273,13 +288,14 @@ async fn main() -> Result<(), Error> {
                     .join(",")
             );
             print!("inserting new aliases ");
+            info!("inserting new aliases ");
             std::io::stdout().flush().unwrap();
             let new_alias_result = connection.query_drop(&last_query);
             if new_alias_result.is_err() {
-                eprintln!("\nlast query: {}", last_query);
+                error_and_log(&format!("\nlast query: {}", last_query));
                 return Err(new_alias_result.unwrap_err());
             }
-            println!("({} pages)", connection.affected_rows());
+            println_and_log(&format!("({} pages)", connection.affected_rows()));
 
             // insert new pages
             last_query = format!(
@@ -295,16 +311,18 @@ async fn main() -> Result<(), Error> {
                     .join(",")
             );
             print!("inserting new pages ");
+            info!("inserting new pages ");
             std::io::stdout().flush().unwrap();
             let new_pages_result = connection.query_drop(&last_query);
             if new_pages_result.is_err() {
-                eprintln!("\nlast query: {}", last_query);
+                error_and_log(&format!("\nlast query: {}", last_query));
                 return Err(new_pages_result.unwrap_err());
             }
-            println!("({} pages)", connection.affected_rows());
+            println_and_log(&format!("({} pages)", connection.affected_rows()));
 
             // transform the results array into an array of relations between pages
             print!("generating relations ");
+            info!("generating relations ");
             std::io::stdout().flush().unwrap();
 
             let relations_found = results
@@ -320,7 +338,7 @@ async fn main() -> Result<(), Error> {
                 })
                 .flatten()
                 .collect::<HashSet<(&Page, &Page)>>();
-            println!("({} relations)", relations_found.len());
+            println_and_log(&format!("({} relations)", relations_found.len()));
 
             // insert the new relations
             last_query = format!(
@@ -332,13 +350,14 @@ async fn main() -> Result<(), Error> {
                     .join(", ")
             );
             print!("inserting the relations ");
+            info!("inserting the relations ");
             std::io::stdout().flush().unwrap();
             let insert_relations = connection.query_drop(&last_query);
             if insert_relations.is_err() {
-                eprintln!("\nlast query: {}", last_query);
+                error_and_log(&format!("\nlast query: {}", last_query));
                 return Err(insert_relations.unwrap_err());
             }
-            println!("({} relations)", connection.affected_rows());
+            println_and_log(&format!("({} relations)", connection.affected_rows()));
         }
 
         // mark as explored
@@ -351,16 +370,17 @@ async fn main() -> Result<(), Error> {
                 .join(", ")
         );
         print!("marking pages as explored ");
+        info!("marking pages as explored ");
         std::io::stdout().flush().unwrap();
         let mark_unexplored_result = connection.query_drop(&last_query);
         if mark_unexplored_result.is_err() {
-            eprintln!("\nlast query: {}", last_query);
+            error_and_log(&format!("\nlast query: {}", last_query));
             return Err(mark_unexplored_result.unwrap_err());
         }
-        println!("({} pages)", connection.affected_rows());
+        println_and_log(&format!("({} pages)", connection.affected_rows()));
 
         // status info
-        println!(
+        println_and_log(&format!(
             "\nexplored {} pages (with {} bugged) \nfound {} pages \nlisted {} links\n",
             connection
                 .query_first("SELECT COUNT(*) FROM Pages WHERE explored = TRUE;")
@@ -378,7 +398,7 @@ async fn main() -> Result<(), Error> {
                 .query_first("SELECT COUNT(*) FROM Links;")
                 .unwrap()
                 .unwrap_or(-1)
-        );
+        ));
     }
 
     return Ok(());
@@ -526,7 +546,7 @@ async fn extract_link_info_api(url: String) -> Page {
                     thread::sleep(Duration::from_secs(RETRY_COOLDOWN));
                     continue;
                 } else {
-                    println!("API couldn't find {}: \n{}", url, body);
+                    println_and_log(&format!("API couldn't find {}: \n{}", url, body));
                     loop_count = 3;
                 }
             }
@@ -574,4 +594,59 @@ fn format_link_for_query(link: &String) -> String {
             _ => c.to_string(),
         })
         .collect()
+}
+
+fn setup_logs() -> Result<(), Error> {
+    std::fs::DirBuilder::new().recursive(true).create("logs")?;
+    let mut log_name = Local::now().format("%Y-%m-%d").to_string();
+    let existing_logs = std::fs::read_dir("logs")?;
+    let this_day_logs = existing_logs
+        .into_iter()
+        .filter_map(|file| match file {
+            Ok(entry) => match entry.file_name().into_string() {
+                Ok(name) => {
+                    if name.starts_with(&log_name) {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            },
+            Err(_) => None,
+        })
+        .count();
+    if this_day_logs > 0 {
+        log_name.push_str(&format!("({})", this_day_logs + 1));
+    }
+
+    let target =
+        Box::new(File::create(format!("logs/{}.log", log_name)).expect("Can't create file"));
+
+    Builder::new()
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "{}-[{}]: {}",
+                Local::now().format("%Y-%m-%d_%H:%M:%S%.3f"),
+                record.level(),
+                record.args()
+            )
+        })
+        .target(env_logger::Target::Pipe(target))
+        .filter(None, LevelFilter::Info)
+        .init();
+
+    info!("Starting the program");
+    Ok(())
+}
+
+fn println_and_log(message: &str) {
+    println!("{}", message);
+    info!("{}", message);
+}
+
+fn error_and_log(message: &str) {
+    eprintln!("{}", message);
+    error!("{}", message);
 }
