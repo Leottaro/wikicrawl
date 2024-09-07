@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::ops::AddAssign;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,34 +17,34 @@ const ENV_PATH: &str = ".env";
 const ENV_DEFAULT: &str =
     "WIKICRAWL_USER=root\nWIKICRAWL_PASSWORD=root\nWIKICRAWL_HOST=localhost\nWIKICRAWL_PORT=3306\nWIKICRAWL_CONCURRENT_PAGES=10\nWIKICRAWL_CHUNK_SIZE=200\n";
 const WIKIPEDIA_NAMESPACES: [&str; 28] = [
-    "média",
-    "spécial",
-    "discussion",
-    "utilisateur",
-    "discussion_utilisateur",
-    "wikipédia",
-    "discussion_wikipédia",
-    "fichier",
-    "discussion_fichier",
-    "mediawiki",
-    "discussion_mediawiki",
-    "modèle",
-    "discussion_modèle",
-    "aide",
-    "discussion_aide",
-    "catégorie",
-    "discussion_catégorie",
-    "portail",
-    "discussion_portail",
-    "projet",
-    "discussion_projet",
-    "référence",
-    "discussion_référence",
-    "timedtext",
-    "timedtext_talk",
-    "module",
-    "discussion_module",
-    "sujet",
+    "média:",
+    "spécial:",
+    "discussion:",
+    "utilisateur:",
+    "discussion_utilisateur:",
+    "wikipédia:",
+    "discussion_wikipédia:",
+    "fichier:",
+    "discussion_fichier:",
+    "mediawiki:",
+    "discussion_mediawiki:",
+    "modèle:",
+    "discussion_modèle:",
+    "aide:",
+    "discussion_aide:",
+    "catégorie:",
+    "discussion_catégorie:",
+    "portail:",
+    "discussion_portail:",
+    "projet:",
+    "discussion_projet:",
+    "référence:",
+    "discussion_référence:",
+    "timedtext:",
+    "timedtext_talk:",
+    "module:",
+    "discussion_module:",
+    "sujet:",
 ];
 const RETRY_COOLDOWN: u64 = 1;
 
@@ -120,7 +121,7 @@ async fn main() -> Result<(), Error> {
             let child = task::spawn(async move {
                 let explore_result = explore(&page.url).await;
                 print!(
-                    "waiting for threads to finish 0/{} (0%)\t\r",
+                    "waiting for threads to finish 0/{} (0%)    \r",
                     max_concurrent_pages
                 );
                 std::io::stdout().flush().unwrap();
@@ -133,7 +134,7 @@ async fn main() -> Result<(), Error> {
         });
 
         print!(
-            "waiting for threads to finish 0/{} (0%)\t\r",
+            "waiting for threads to finish 0/{} (0%)    \r",
             max_concurrent_pages
         );
         std::io::stdout().flush().unwrap();
@@ -175,9 +176,9 @@ async fn main() -> Result<(), Error> {
 
         let found_links = results
             .iter()
-            .map(|(_, links)| links)
+            .map(|(_, links)| links.clone())
             .flatten()
-            .collect::<HashSet<&String>>();
+            .collect::<HashSet<String>>();
         println!("found {} links", found_links.len());
 
         let now = Instant::now();
@@ -208,34 +209,51 @@ async fn main() -> Result<(), Error> {
         );
         std::io::stdout().flush().unwrap();
 
-        let mut total_elapsed: u128 = 0;
-        for chunk in found_links
-            .into_iter()
-            .filter(|link| !found_pages.contains_key(link.to_owned()))
-            .collect::<Vec<&String>>()
-            .chunks(chunk_size)
-        {
-            let now = Instant::now();
-            let new_pages_children = chunk.into_iter().map(|link| {
-                let owned_link = link.to_string();
-                task::spawn(
-                    async move { (owned_link.clone(), extract_link_info_api(owned_link).await) },
-                )
-            });
-            let new_pages = new_pages_children
+        let shared_links = Arc::new(Mutex::new(
+            found_links
                 .into_iter()
-                .map(|child| async move { child.await.unwrap() });
-            found_pages.extend(futures::future::join_all(new_pages).await);
+                .filter(|link| !found_pages.contains_key(link))
+                .collect::<Vec<String>>()
+                .into_iter(),
+        ));
+        let shared_count = Arc::new(Mutex::new(found_pages.len()));
+        let shared_now = Arc::new(Mutex::new(Instant::now()));
 
-            let elapsed = now.elapsed().as_millis();
-            total_elapsed += elapsed;
-            print!("found {} pages ({}ms)      \r", found_pages.len(), elapsed);
-            std::io::stdout().flush().unwrap();
-        }
+        let new_pages_children = (0..chunk_size).into_iter().map(|_| {
+            let thread_links = Arc::clone(&shared_links);
+            let thread_count = Arc::clone(&shared_count);
+            let thread_now = Arc::clone(&shared_now);
+            task::spawn(async move {
+                let mut thread_pages: Vec<(String, Page)> = Vec::new();
+                while let Some(link) = {
+                    let mut links = thread_links.lock().unwrap();
+                    links.next()
+                } {
+                    let page = extract_link_info_api(link.to_string()).await;
+                    thread_pages.push((link.to_string(), page));
+                    thread_count.lock().unwrap().add_assign(1);
+                    print!(
+                        "found {} pages ({}ms)      \r",
+                        thread_count.lock().unwrap(),
+                        thread_now.lock().unwrap().elapsed().as_millis()
+                    );
+                }
+                thread_pages
+            })
+        });
+        let new_pages = new_pages_children
+            .into_iter()
+            .map(|child| async move { child.await.unwrap() });
+        let new_pages = futures::future::join_all(new_pages)
+            .await
+            .into_iter()
+            .flatten()
+            .collect::<Vec<(String, Page)>>();
+        found_pages.extend(new_pages);
         println!(
-            "found {} pages ({}ms)     ",
+            "found {} pages ({}ms)      ",
             found_pages.len(),
-            total_elapsed
+            shared_now.lock().unwrap().elapsed().as_millis()
         );
 
         if found_pages.is_empty() {
@@ -395,8 +413,8 @@ fn get_env() -> Result<(String, usize, usize), Error> {
 
     let vars = env_content
         .split("\n")
-        .map(|line| line.split_once("=").unwrap_or(("", "")))
-        .map(|(str1, str2)| (str1.split_at(10).1.to_string(), str2.to_string()))
+        .filter_map(|line| line.split_once("="))
+        .map(|(str1, str2)| (str1.to_string().split_off(10), str2.to_string()))
         .collect::<HashMap<String, String>>();
 
     if !vars.contains_key("USER")
