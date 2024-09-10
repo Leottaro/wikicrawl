@@ -128,12 +128,17 @@ async fn main() -> Result<(), Error> {
         let mut results: Vec<(Page, Vec<String>)> = Vec::new();
         let mut bugged_pages: Vec<Page> = Vec::new();
         let mut children: Vec<task::JoinHandle<(Page, Option<Vec<String>>)>> = Vec::new();
+        let shared_explore_regex = Arc::new(Mutex::new(
+            Regex::new(r#"(?m)"\/wiki\/([^"\/]+?)(?:#.+?)?"[ >]"#).unwrap(),
+        ));
 
         println_and_log(&format!("spawning threads"));
 
         unexplored_pages.into_iter().for_each(|page| {
+            let thread_explore_regex = Arc::clone(&shared_explore_regex);
             let child = task::spawn(async move {
-                let explore_result = explore(&page.url).await;
+                let explore_result =
+                    explore(&format_url_for_reqwest(&page.url), thread_explore_regex).await;
                 print!(
                     "waiting for threads to finish 0/{} (0%)    \r",
                     max_concurrent_pages
@@ -203,7 +208,7 @@ async fn main() -> Result<(), Error> {
 			"SELECT Alias.alias, Pages.id, Pages.url FROM Pages JOIN Alias ON Pages.id = Alias.id WHERE alias IN ({});", 
 			found_links
 				.iter()
-				.map(|link| format!("\"{}\"", format_link_for_query(link)))
+				.map(|link| format!("\"{}\"", format_link_for_mysql(link)))
 				.collect::<Vec<String>>()
 				.join(", "));
         let found_pages_result = connection
@@ -255,7 +260,7 @@ async fn main() -> Result<(), Error> {
                     (*links).next()
                 } {
                     let page = extract_link_info_api(
-                        link.to_string(),
+                        format_url_for_reqwest(&link),
                         &thread_api_regex,
                         &thread_web_regex,
                     )
@@ -297,7 +302,7 @@ async fn main() -> Result<(), Error> {
                     .iter()
                     .map(|(alias, page)| format!(
                         "(\"{}\", {})",
-                        format_link_for_query(alias),
+                        format_link_for_mysql(alias),
                         page.id
                     ))
                     .collect::<Vec<String>>()
@@ -321,7 +326,7 @@ async fn main() -> Result<(), Error> {
                     .map(|(_, page)| format!(
                         "({}, \"{}\")",
                         page.id,
-                        format_link_for_query(&page.url)
+                        format_link_for_mysql(&page.url)
                     ))
                     .collect::<Vec<String>>()
                     .join(",")
@@ -476,57 +481,49 @@ fn get_env() -> Result<(String, usize, usize), Error> {
     ))
 }
 
-async fn explore(url: &String) -> Result<Vec<String>, Error> {
-    let regex = Regex::new(r#"(?m)"\/wiki\/([^"\/]+)""#).unwrap();
+async fn explore(url: &String, regex: Arc<Mutex<Regex>>) -> Result<Vec<String>, Error> {
+    let request = format!("https://fr.m.wikipedia.org/wiki/{}", url);
 
-    let body = reqwest::get(format!("https://fr.m.wikipedia.org/wiki/{}", url))
+    let body = reqwest::get(request.clone())
         .await
-        .unwrap()
-        .text()
-        .await;
-
-    if body.is_err() {
-        return Err(Error::from(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "Error: Couldn't get text of page {}:\n{}",
-                url,
-                body.unwrap_err()
-            ),
-        )));
-    }
-
-    let found_links = regex
-        .captures_iter(body.unwrap().as_str())
-        .map(|captures| {
-            decode(captures.get(1).unwrap().as_str())
-                .unwrap()
-                .into_owned()
-                .chars()
-                .map(|c| match c {
-                    '?' => "%3F".to_string(),
-                    _ => c.to_lowercase().to_string(),
-                })
-                .collect::<String>()
+        .unwrap_or_else(|error| {
+            println!("{}", url);
+            panic!("{}", error);
         })
-        .collect::<HashSet<String>>()
-        .into_iter()
-        .collect::<Vec<String>>();
+        .text()
+        .await
+        .unwrap();
+
+    let found_links = {
+        let owned_regex = regex.lock().unwrap();
+        (*owned_regex)
+            .captures_iter(body.as_str())
+            .map(|captures| {
+                decode(captures.get(1).unwrap().as_str())
+                    .unwrap()
+                    .into_owned()
+                    .to_ascii_lowercase()
+            })
+            .collect::<HashSet<String>>()
+    };
+
+    if found_links.is_empty() {
+        error_and_log(&format!("No links found in: {}", request));
+        std::process::exit(0);
+    }
 
     let filtered_links = found_links
         .into_iter()
         .filter(|link| {
             !WIKIPEDIA_NAMESPACES
                 .iter()
-                .any(|impossible| link.to_ascii_lowercase().starts_with(impossible))
+                .any(|namespace| link.starts_with(namespace))
         })
         .collect::<Vec<String>>();
 
     if filtered_links.is_empty() {
-        return Err(Error::from(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "No links found",
-        )));
+        error_and_log(&format!("No links found in: {}", request));
+        std::process::exit(0);
     }
 
     Ok(filtered_links)
@@ -618,16 +615,6 @@ async fn extract_link_info_web(url: String, regex: &Arc<Mutex<Regex>>) -> Page {
     }
 }
 
-fn format_link_for_query(link: &String) -> String {
-    link.chars()
-        .map(|c| match c {
-            '\\' => "\\\\".to_string(),
-            '\"' => "\"\"".to_string(),
-            _ => c.to_string(),
-        })
-        .collect()
-}
-
 fn setup_logs() -> Result<(), Error> {
     std::fs::DirBuilder::new().recursive(true).create("logs")?;
     let mut log_name = Local::now().format("%Y-%m-%d").to_string();
@@ -671,6 +658,25 @@ fn setup_logs() -> Result<(), Error> {
 
     info!("Starting the program");
     Ok(())
+}
+
+fn format_link_for_mysql(link: &String) -> String {
+    link.chars()
+        .map(|char| match char {
+            '\\' => "\\\\".to_string(),
+            '"' => "\"\"".to_string(),
+            _ => char.to_string(),
+        })
+        .collect()
+}
+
+fn format_url_for_reqwest(url: &String) -> String {
+    url.chars()
+        .map(|char| match char {
+            '&' => "%26".to_string(),
+            _ => char.to_string(),
+        })
+        .collect()
 }
 
 fn println_and_log(message: &str) {
