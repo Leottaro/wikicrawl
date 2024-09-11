@@ -13,7 +13,7 @@ use mysql::*;
 use regex::Regex;
 use signal_hook::consts::SIGINT;
 use signal_hook::iterator::Signals;
-use tokio::task;
+use tokio::task::JoinHandle;
 use urlencoding::decode;
 
 const ENV_PATH: &str = ".env";
@@ -127,7 +127,7 @@ async fn main() -> Result<(), Error> {
 
         let mut results: Vec<(Page, Vec<String>)> = Vec::new();
         let mut bugged_pages: Vec<Page> = Vec::new();
-        let mut children: Vec<task::JoinHandle<(Page, Option<Vec<String>>)>> = Vec::new();
+        let mut children: Vec<JoinHandle<(Page, Option<Vec<String>>)>> = Vec::new();
         let shared_explore_regex = Arc::new(Mutex::new(
             Regex::new(r#"(?m)"\/wiki\/([^"\/]+?)(?:#.+?)?"[ >]"#).unwrap(),
         ));
@@ -136,7 +136,7 @@ async fn main() -> Result<(), Error> {
 
         unexplored_pages.into_iter().for_each(|page| {
             let thread_explore_regex = Arc::clone(&shared_explore_regex);
-            let child = task::spawn(async move {
+            let child = tokio::spawn(async move {
                 let explore_result =
                     explore(&format_url_for_reqwest(&page.url), thread_explore_regex).await;
                 print!(
@@ -203,182 +203,186 @@ async fn main() -> Result<(), Error> {
             .collect::<HashSet<String>>();
         println_and_log(&format!("found {} links", found_links.len()));
 
-        let now = Instant::now();
-        last_query = format!(
+        if found_links.is_empty() {
+            warn_and_log(&format!("no links found"));
+        } else {
+            let now = Instant::now();
+            last_query = format!(
 			"SELECT Alias.alias, Pages.id, Pages.url FROM Pages JOIN Alias ON Pages.id = Alias.id WHERE alias IN ({});", 
 			found_links
 				.iter()
 				.map(|link| format!("\"{}\"", format_link_for_mysql(link)))
 				.collect::<Vec<String>>()
 				.join(", "));
-        let found_pages_result = connection
-            .query_map(&last_query, |(alias, id, url): (String, usize, String)| {
-                (alias, Page { id, url })
-            });
-        if found_pages_result.is_err() {
-            error_and_log(&format!("\nlast query: {}", last_query));
-            return Err(found_pages_result.unwrap_err());
-        }
-        let mut found_pages = found_pages_result
-            .unwrap()
-            .into_iter()
-            .collect::<HashMap<String, Page>>();
-
-        print!(
-            "found {} pages ({}ms)      \r",
-            found_pages.len(),
-            now.elapsed().as_millis()
-        );
-        std::io::stdout().flush().unwrap();
-
-        let shared_links = Arc::new(Mutex::new(
-            found_links
+            let found_pages_result = connection
+                .query_map(&last_query, |(alias, id, url): (String, usize, String)| {
+                    (alias, Page { id, url })
+                });
+            if found_pages_result.is_err() {
+                error_and_log(&format!("\nlast query: {}", last_query));
+                return Err(found_pages_result.unwrap_err());
+            }
+            let mut found_pages = found_pages_result
+                .unwrap()
                 .into_iter()
-                .filter(|link| !found_pages.contains_key(link))
-                .collect::<Vec<String>>()
-                .into_iter(),
-        ));
-        let shared_count = Arc::new(Mutex::new(found_pages.len()));
-        let shared_now = Arc::new(Mutex::new(Instant::now()));
-        let shared_api_regex = Arc::new(Mutex::new(
-            Regex::new(r#","title":"(.+)","pageid":([0-9]+),"#).unwrap(),
-        ));
-        let shared_web_regex = Arc::new(Mutex::new(Regex::new(
+                .collect::<HashMap<String, Page>>();
+
+            print!(
+                "found {} pages ({}ms)      \r",
+                found_pages.len(),
+                now.elapsed().as_millis()
+            );
+            std::io::stdout().flush().unwrap();
+
+            let shared_links = Arc::new(Mutex::new(
+                found_links
+                    .into_iter()
+                    .filter(|link| !found_pages.contains_key(link))
+                    .collect::<Vec<String>>()
+                    .into_iter(),
+            ));
+            let shared_count = Arc::new(Mutex::new(found_pages.len()));
+            let shared_now = Arc::new(Mutex::new(Instant::now()));
+            let shared_api_regex = Arc::new(Mutex::new(
+                Regex::new(r#","title":"(.+)","pageid":([0-9]+),"#).unwrap(),
+            ));
+            let shared_web_regex = Arc::new(Mutex::new(Regex::new(
 			r#"(?m)"wgTitle":"(.*?)",\n?"wgCurRevisionId":[0-9]+,\n?"wgRevisionId":[0-9]+,\n?"wgArticleId":([0-9]+),"#,
 		).unwrap()));
 
-        let new_pages_children = (0..chunk_size).into_iter().map(|_| {
-            let mut thread_pages: Vec<(String, Page)> = Vec::new();
-            let thread_links = Arc::clone(&shared_links);
-            let thread_count = Arc::clone(&shared_count);
-            let thread_now = Arc::clone(&shared_now);
-            let thread_api_regex = Arc::clone(&shared_api_regex);
-            let thread_web_regex = Arc::clone(&shared_web_regex);
-            task::spawn(async move {
-                while let Some(link) = {
-                    let mut links = thread_links.lock().unwrap();
-                    (*links).next()
-                } {
-                    let page = extract_link_info_api(
-                        format_url_for_reqwest(&link),
-                        &thread_api_regex,
-                        &thread_web_regex,
-                    )
-                    .await;
-                    let (elapsed, count) = {
-                        let now = thread_now.lock().unwrap();
-                        let mut count = thread_count.lock().unwrap();
-                        *count += 1;
-                        (now.elapsed().as_millis(), *count)
-                    };
-                    print!("found {} pages ({}ms)      \r", count, elapsed);
-                    thread_pages.push((link.to_string(), page));
-                }
-                thread_pages
-            })
-        });
-        let new_pages = new_pages_children
-            .into_iter()
-            .map(|child| async move { child.await.unwrap() });
-        let new_pages = futures::future::join_all(new_pages)
-            .await
-            .into_iter()
-            .flatten()
-            .collect::<Vec<(String, Page)>>();
-        found_pages.extend(new_pages);
-        println_and_log(&format!(
-            "found {} pages ({}ms)      ",
-            found_pages.len(),
-            shared_now.lock().unwrap().elapsed().as_millis()
-        ));
-
-        if found_pages.is_empty() {
-            println_and_log(&format!("No links found"));
-        } else {
-            // insert new aliases
-            last_query = format!(
-                "INSERT IGNORE INTO Alias (alias, id) VALUES {};",
-                found_pages
-                    .iter()
-                    .map(|(alias, page)| format!(
-                        "(\"{}\", {})",
-                        format_link_for_mysql(alias),
-                        page.id
-                    ))
-                    .collect::<Vec<String>>()
-                    .join(",")
-            );
-            print!("inserting new aliases ");
-            info!("inserting new aliases ");
-            std::io::stdout().flush().unwrap();
-            let new_alias_result = connection.query_drop(&last_query);
-            if new_alias_result.is_err() {
-                error_and_log(&format!("\nlast query: {}", last_query));
-                return Err(new_alias_result.unwrap_err());
-            }
-            println_and_log(&format!("({} pages)", connection.affected_rows()));
-
-            // insert new pages
-            last_query = format!(
-                "INSERT IGNORE INTO Pages (id, url) VALUES {};",
-                found_pages
-                    .iter()
-                    .map(|(_, page)| format!(
-                        "({}, \"{}\")",
-                        page.id,
-                        format_link_for_mysql(&page.url)
-                    ))
-                    .collect::<Vec<String>>()
-                    .join(",")
-            );
-            print!("inserting new pages ");
-            info!("inserting new pages ");
-            std::io::stdout().flush().unwrap();
-            let new_pages_result = connection.query_drop(&last_query);
-            if new_pages_result.is_err() {
-                error_and_log(&format!("\nlast query: {}", last_query));
-                return Err(new_pages_result.unwrap_err());
-            }
-            println_and_log(&format!("({} pages)", connection.affected_rows()));
-
-            // transform the results array into an array of relations between pages
-            print!("generating relations ");
-            info!("generating relations ");
-            std::io::stdout().flush().unwrap();
-
-            let relations_found = results
-                .iter()
-                .map(|(page, links)| {
-                    links
-                        .iter()
-                        .filter_map(|url| {
-                            let linked = found_pages.get(url);
-                            linked.map(|link| (page, link))
-                        })
-                        .collect::<HashSet<(&Page, &Page)>>()
+            let new_pages_children = (0..chunk_size).into_iter().map(|_| {
+                let mut thread_pages: Vec<(String, Page)> = Vec::new();
+                let thread_links = Arc::clone(&shared_links);
+                let thread_count = Arc::clone(&shared_count);
+                let thread_now = Arc::clone(&shared_now);
+                let thread_api_regex = Arc::clone(&shared_api_regex);
+                let thread_web_regex = Arc::clone(&shared_web_regex);
+                tokio::spawn(async move {
+                    while let Some(link) = {
+                        let mut links = thread_links.lock().unwrap();
+                        (*links).next()
+                    } {
+                        let page = extract_link_info_api(
+                            format_url_for_reqwest(&link),
+                            &thread_api_regex,
+                            &thread_web_regex,
+                        )
+                        .await;
+                        let (elapsed, count) = {
+                            let now = thread_now.lock().unwrap();
+                            let mut count = thread_count.lock().unwrap();
+                            *count += 1;
+                            (now.elapsed().as_millis(), *count)
+                        };
+                        print!("found {} pages ({}ms)      \r", count, elapsed);
+                        thread_pages.push((link.to_string(), page));
+                    }
+                    thread_pages
                 })
+            });
+            let new_pages = new_pages_children
+                .into_iter()
+                .map(|child| async move { child.await.unwrap() });
+            let new_pages = futures::future::join_all(new_pages)
+                .await
+                .into_iter()
                 .flatten()
-                .collect::<HashSet<(&Page, &Page)>>();
-            println_and_log(&format!("({} relations)", relations_found.len()));
+                .collect::<Vec<(String, Page)>>();
+            found_pages.extend(new_pages);
+            println_and_log(&format!(
+                "found {} pages ({}ms)      ",
+                found_pages.len(),
+                shared_now.lock().unwrap().elapsed().as_millis()
+            ));
 
-            // insert the new relations
-            last_query = format!(
-                "INSERT IGNORE INTO Links (linker, linked) VALUES {};",
-                relations_found
+            if found_pages.is_empty() {
+                println_and_log(&format!("No links found"));
+            } else {
+                // insert new aliases
+                last_query = format!(
+                    "INSERT IGNORE INTO Alias (alias, id) VALUES {};",
+                    found_pages
+                        .iter()
+                        .map(|(alias, page)| format!(
+                            "(\"{}\", {})",
+                            format_link_for_mysql(alias),
+                            page.id
+                        ))
+                        .collect::<Vec<String>>()
+                        .join(",")
+                );
+                print!("inserting new aliases ");
+                info!("inserting new aliases ");
+                std::io::stdout().flush().unwrap();
+                let new_alias_result = connection.query_drop(&last_query);
+                if new_alias_result.is_err() {
+                    error_and_log(&format!("\nlast query: {}", last_query));
+                    return Err(new_alias_result.unwrap_err());
+                }
+                println_and_log(&format!("({} pages)", connection.affected_rows()));
+
+                // insert new pages
+                last_query = format!(
+                    "INSERT IGNORE INTO Pages (id, url) VALUES {};",
+                    found_pages
+                        .iter()
+                        .map(|(_, page)| format!(
+                            "({}, \"{}\")",
+                            page.id,
+                            format_link_for_mysql(&page.url)
+                        ))
+                        .collect::<Vec<String>>()
+                        .join(",")
+                );
+                print!("inserting new pages ");
+                info!("inserting new pages ");
+                std::io::stdout().flush().unwrap();
+                let new_pages_result = connection.query_drop(&last_query);
+                if new_pages_result.is_err() {
+                    error_and_log(&format!("\nlast query: {}", last_query));
+                    return Err(new_pages_result.unwrap_err());
+                }
+                println_and_log(&format!("({} pages)", connection.affected_rows()));
+
+                // transform the results array into an array of relations between pages
+                print!("generating relations ");
+                info!("generating relations ");
+                std::io::stdout().flush().unwrap();
+
+                let relations_found = results
                     .iter()
-                    .map(|(linker, linked)| format!("({},{})", linker.id, linked.id))
-                    .collect::<Vec<String>>()
-                    .join(", ")
-            );
-            print!("inserting the relations ");
-            info!("inserting the relations ");
-            std::io::stdout().flush().unwrap();
-            let insert_relations = connection.query_drop(&last_query);
-            if insert_relations.is_err() {
-                error_and_log(&format!("\nlast query: {}", last_query));
-                return Err(insert_relations.unwrap_err());
+                    .map(|(page, links)| {
+                        links
+                            .iter()
+                            .filter_map(|url| {
+                                let linked = found_pages.get(url);
+                                linked.map(|link| (page, link))
+                            })
+                            .collect::<HashSet<(&Page, &Page)>>()
+                    })
+                    .flatten()
+                    .collect::<HashSet<(&Page, &Page)>>();
+                println_and_log(&format!("({} relations)", relations_found.len()));
+
+                // insert the new relations
+                last_query = format!(
+                    "INSERT IGNORE INTO Links (linker, linked) VALUES {};",
+                    relations_found
+                        .iter()
+                        .map(|(linker, linked)| format!("({},{})", linker.id, linked.id))
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                );
+                print!("inserting the relations ");
+                info!("inserting the relations ");
+                std::io::stdout().flush().unwrap();
+                let insert_relations = connection.query_drop(&last_query);
+                if insert_relations.is_err() {
+                    error_and_log(&format!("\nlast query: {}", last_query));
+                    return Err(insert_relations.unwrap_err());
+                }
+                println_and_log(&format!("({} relations)", connection.affected_rows()));
             }
-            println_and_log(&format!("({} relations)", connection.affected_rows()));
         }
 
         // mark as explored
@@ -401,24 +405,26 @@ async fn main() -> Result<(), Error> {
         println_and_log(&format!("({} pages)", connection.affected_rows()));
 
         // status info
+        let total_explored = connection
+            .query_first("SELECT COUNT(*) FROM Pages WHERE explored = TRUE;")
+            .unwrap_or(Some(-1))
+            .unwrap_or(-1);
+        let total_bugged = connection
+            .query_first("SELECT COUNT(*) FROM Pages WHERE bugged = TRUE;")
+            .unwrap_or(Some(-1))
+            .unwrap_or(-1);
+        let total_pages = connection
+            .query_first("SELECT COUNT(*) FROM Pages;")
+            .unwrap_or(Some(-1))
+            .unwrap_or(-1);
+        let total_links = connection
+            .query_first("SELECT COUNT(*) FROM Links;")
+            .unwrap_or(Some(-1))
+            .unwrap_or(-1);
+
         println_and_log(&format!(
             "\nexplored {} pages (with {} bugged) \nfound {} pages \nlisted {} links\n",
-            connection
-                .query_first("SELECT COUNT(*) FROM Pages WHERE explored = TRUE;")
-                .unwrap()
-                .unwrap_or(-1),
-            connection
-                .query_first("SELECT COUNT(*) FROM Pages WHERE bugged = TRUE;")
-                .unwrap()
-                .unwrap_or(-1),
-            connection
-                .query_first("SELECT COUNT(*) FROM Pages;")
-                .unwrap()
-                .unwrap_or(-1),
-            connection
-                .query_first("SELECT COUNT(*) FROM Links;")
-                .unwrap()
-                .unwrap_or(-1)
+            total_explored, total_bugged, total_pages, total_links
         ));
     }
 
