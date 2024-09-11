@@ -137,8 +137,7 @@ async fn main() -> Result<(), Error> {
         unexplored_pages.into_iter().for_each(|page| {
             let thread_explore_regex = Arc::clone(&shared_explore_regex);
             let child = tokio::spawn(async move {
-                let explore_result =
-                    explore(&format_url_for_reqwest(&page.url), thread_explore_regex).await;
+                let explore_result = explore(&page.url, thread_explore_regex).await;
                 print!(
                     "waiting for threads to finish 0/{} (0%)    \r",
                     max_concurrent_pages
@@ -262,12 +261,9 @@ async fn main() -> Result<(), Error> {
                         let mut links = thread_links.lock().unwrap();
                         (*links).next()
                     } {
-                        let page = extract_link_info_api(
-                            format_url_for_reqwest(&link),
-                            &thread_api_regex,
-                            &thread_web_regex,
-                        )
-                        .await;
+                        let page =
+                            extract_link_info_api(&link, &thread_api_regex, &thread_web_regex)
+                                .await;
                         let (elapsed, count) = {
                             let now = thread_now.lock().unwrap();
                             let mut count = thread_count.lock().unwrap();
@@ -536,16 +532,17 @@ async fn explore(url: &String, regex: Arc<Mutex<Regex>>) -> Result<Vec<String>, 
 }
 
 async fn extract_link_info_api(
-    url: String,
+    url: &String,
     api_regex: &Arc<Mutex<Regex>>,
     web_regex: &Arc<Mutex<Regex>>,
 ) -> Page {
+    let formatted_url = format_url_for_api_reqwest(&url);
     let request = format!(
 		"https://fr.m.wikipedia.org/w/api.php?action=query&format=json&list=search&utf8=1&formatversion=2&srnamespace=0&srlimit=1&srsearch={}", 
-		url
+		formatted_url
 	);
 
-    if url.len() > 98 {
+    if formatted_url.len() > 98 {
         return extract_link_info_web(url, web_regex).await;
     }
 
@@ -588,7 +585,7 @@ async fn extract_link_info_api(
     }
 }
 
-async fn extract_link_info_web(url: String, regex: &Arc<Mutex<Regex>>) -> Page {
+async fn extract_link_info_web(url: &String, regex: &Arc<Mutex<Regex>>) -> Page {
     let request = format!("https://fr.m.wikipedia.org/wiki/Spécial:Recherche/{}", url);
     loop {
         let body = reqwest::get(&request)
@@ -676,10 +673,11 @@ fn format_link_for_mysql(link: &String) -> String {
         .collect()
 }
 
-fn format_url_for_reqwest(url: &String) -> String {
+fn format_url_for_api_reqwest(url: &String) -> String {
     url.chars()
         .map(|char| match char {
             '&' => "%26".to_string(),
+            '*' => "\\*".to_string(),
             _ => char.to_string(),
         })
         .collect()
