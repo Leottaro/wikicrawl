@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
+use std::ops::SubAssign;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -121,6 +122,11 @@ async fn main() -> Result<(), Error> {
         .query_first("SELECT COUNT(*) FROM Links;")
         .unwrap_or(Some(0))
         .unwrap_or(0);
+
+    println_and_log(&format!(
+        "\nexplored {} pages (with {} bugged) \nfound {} pages \nlisted {} links\n",
+        total_explored, total_bugged, total_pages, total_links
+    ));
 
     let mut last_query: String;
     while {
@@ -266,8 +272,8 @@ async fn main() -> Result<(), Error> {
                 .into_iter()
                 .filter(|link| !old_pages.contains_key(link))
                 .collect::<Vec<String>>();
+            let shared_count = Arc::new(Mutex::new(new_links.len()));
             let shared_links = Arc::new(Mutex::new(new_links.into_iter()));
-            let shared_count = Arc::new(Mutex::new(0));
             let shared_now = Arc::new(Mutex::new(Instant::now()));
             let shared_api_regex = Arc::new(Mutex::new(
                 Regex::new(r#","title":"(.+)","pageid":([0-9]+),"#).unwrap(),
@@ -294,10 +300,10 @@ async fn main() -> Result<(), Error> {
                         let (elapsed, count) = {
                             let now = thread_now.lock().unwrap();
                             let mut count = thread_count.lock().unwrap();
-                            *count += 1;
+                            (*count).sub_assign(1);
                             (now.elapsed().as_millis(), *count)
                         };
-                        print!("found {} pages ({}ms)      \r", count, elapsed);
+                        print!("{} pages left to explore ({}ms)      \r", count, elapsed);
                         thread_pages.push((link.to_string(), page));
                     }
                     thread_pages
@@ -337,6 +343,7 @@ async fn main() -> Result<(), Error> {
             let (found_again_pages, new_pages): (HashMap<String, Page>, HashMap<String, Page>) =
                 found_pages
                     .into_iter()
+                    .filter(|(_, page)| page.id != 0)
                     .partition(|(_, page)| found_again_pages_ids.contains(&page.id));
 
             println_and_log(&format!(
@@ -351,12 +358,15 @@ async fn main() -> Result<(), Error> {
                 println_and_log(&format!("No links found"));
             } else {
                 // insert new pages
+                let unique_new_pages = new_pages
+                    .iter()
+                    .map(|(_, page)| page)
+                    .collect::<HashSet<&Page>>();
+                let added_pages = unique_new_pages.len();
+                total_pages += added_pages;
                 last_query = format!(
                     "INSERT INTO Pages (id, url) VALUES {};",
-                    new_pages
-                        .iter()
-                        .map(|(_, page)| page)
-                        .collect::<HashSet<&Page>>()
+                    unique_new_pages
                         .into_iter()
                         .map(|page| format!(
                             "({}, \"{}\")",
@@ -372,8 +382,7 @@ async fn main() -> Result<(), Error> {
                     error_and_log(&format!("\nlast query: {}", last_query));
                     return Err(new_pages_result.unwrap_err());
                 }
-                println_and_log(&format!("inserted {} new pages", new_pages.len()));
-                total_pages += new_pages.len();
+                println_and_log(&format!("inserted {} new pages", added_pages));
 
                 // insert aliases of new Pages
                 last_query = format!(
@@ -395,7 +404,6 @@ async fn main() -> Result<(), Error> {
                     return Err(new_alias_result.unwrap_err());
                 }
                 println_and_log(&format!("inserted {} aliases", new_pages.len()));
-                total_pages += new_pages.len();
 
                 // transform the results array into an array of relations between pages
                 println_and_log("generating relations ");
