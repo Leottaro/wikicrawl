@@ -238,9 +238,7 @@ async fn main() -> Result<(), Error> {
             .collect::<HashSet<String>>();
         println_and_log(&format!("found {} links", found_links.len()));
 
-        if found_links.is_empty() {
-            warn_and_log(&format!("no links found"));
-        } else {
+        if found_links.len() > 0 {
             let now = Instant::now();
             last_query = format!(
 			"SELECT Alias.alias, Pages.id, Pages.url FROM Pages JOIN Alias ON Pages.id = Alias.id WHERE alias IN ({});", 
@@ -346,23 +344,22 @@ async fn main() -> Result<(), Error> {
                     .filter(|(_, page)| page.id != 0)
                     .partition(|(_, page)| found_again_pages_ids.contains(&page.id));
 
-            println_and_log(&format!(
-                "found {} new pages \nfound again {} old pages",
-                new_pages.len(),
-                found_again_pages.len()
-            ));
-
             old_pages.extend(found_again_pages.into_iter());
 
-            if new_pages.is_empty() && old_pages.is_empty() {
-                println_and_log(&format!("No links found"));
-            } else {
-                // insert new pages
-                let unique_new_pages = new_pages
-                    .iter()
-                    .map(|(_, page)| page)
-                    .collect::<HashSet<&Page>>();
-                let added_pages = unique_new_pages.len();
+            let unique_new_pages = new_pages
+                .iter()
+                .map(|(_, page)| page)
+                .collect::<HashSet<&Page>>();
+            let added_pages = unique_new_pages.len();
+
+            println_and_log(&format!(
+                "found {} new pages \nfound again {} old pages",
+                unique_new_pages.len(),
+                old_pages.len()
+            ));
+
+            // insert new pages
+            if added_pages > 0 {
                 total_pages += added_pages;
                 last_query = format!(
                     "INSERT INTO Pages (id, url) VALUES {};",
@@ -383,8 +380,10 @@ async fn main() -> Result<(), Error> {
                     return Err(new_pages_result.unwrap_err());
                 }
                 println_and_log(&format!("inserted {} new pages", added_pages));
+            }
 
-                // insert aliases of new Pages
+            // insert aliases of new Pages
+            if new_pages.len() > 0 {
                 last_query = format!(
                     "INSERT INTO Alias (alias, id) VALUES {};",
                     new_pages
@@ -397,50 +396,49 @@ async fn main() -> Result<(), Error> {
                         .collect::<Vec<String>>()
                         .join(",")
                 );
-                println_and_log("inserting aliases of new pages");
+                println_and_log("inserting aliases of found pages");
                 let new_alias_result = connection.query_drop(&last_query);
                 if new_alias_result.is_err() {
                     error_and_log(&format!("\nlast query: {}", last_query));
                     return Err(new_alias_result.unwrap_err());
                 }
                 println_and_log(&format!("inserted {} aliases", new_pages.len()));
-
-                // transform the results array into an array of relations between pages
-                println_and_log("generating relations ");
-
-                let relations_found = results
-                    .iter()
-                    .map(|(page, links)| {
-                        links
-                            .iter()
-                            .filter_map(|url| {
-                                let linked = old_pages.get(url).or(new_pages.get(url));
-                                linked.map(|link| (page, link))
-                            })
-                            .collect::<HashSet<(&Page, &Page)>>()
-                    })
-                    .flatten()
-                    .collect::<HashSet<(&Page, &Page)>>();
-                println_and_log(&format!("({} relations)", relations_found.len()));
-
-                // insert the new relations
-                last_query = format!(
-                    "INSERT INTO Links (linker, linked) VALUES {};",
-                    relations_found
-                        .iter()
-                        .map(|(linker, linked)| format!("({},{})", linker.id, linked.id))
-                        .collect::<Vec<String>>()
-                        .join(", ")
-                );
-                println_and_log("inserting the relations ");
-                let insert_relations = connection.query_drop(&last_query);
-                if insert_relations.is_err() {
-                    error_and_log(&format!("\nlast query: {}", last_query));
-                    return Err(insert_relations.unwrap_err());
-                }
-                println_and_log(&format!("({} relations)", relations_found.len()));
-                total_links += relations_found.len();
             }
+
+            // transform the results array into an array of relations between pages
+            println_and_log("generating relations ");
+            let relations_found = results
+                .iter()
+                .map(|(page, links)| {
+                    links
+                        .iter()
+                        .filter_map(|url| {
+                            let linked = old_pages.get(url).or(new_pages.get(url));
+                            linked.map(|link| (page, link))
+                        })
+                        .collect::<HashSet<(&Page, &Page)>>()
+                })
+                .flatten()
+                .collect::<HashSet<(&Page, &Page)>>();
+            println_and_log(&format!("({} relations)", relations_found.len()));
+
+            // insert the new relations
+            last_query = format!(
+                "INSERT INTO Links (linker, linked) VALUES {};",
+                relations_found
+                    .iter()
+                    .map(|(linker, linked)| format!("({},{})", linker.id, linked.id))
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            );
+            println_and_log("inserting the relations ");
+            let insert_relations = connection.query_drop(&last_query);
+            if insert_relations.is_err() {
+                error_and_log(&format!("\nlast query: {}", last_query));
+                return Err(insert_relations.unwrap_err());
+            }
+            println_and_log(&format!("({} relations)", relations_found.len()));
+            total_links += relations_found.len();
         }
 
         // mark as explored
