@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Display;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
-use std::ops::SubAssign;
+use std::ops::{AddAssign, SubAssign};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -71,10 +72,21 @@ impl Hash for Page {
     }
 }
 
+impl Display for Page {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ \"id\": {}, \"title\": \"{}\" }}",
+            self.id,
+            self.title.replace("\"", "\\\"")
+        )
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     setup_logs()?;
-    info!("Starting the program");
+    println_and_log("Starting the program");
 
     let env_result = get_env();
     if env_result.is_err() {
@@ -154,10 +166,10 @@ async fn main() -> Result<(), Error> {
             )));
         }
         println_and_log(&format!(
-            "Exploring pages: {}",
+            "Exploring pages: [{}]",
             unexplored_pages
                 .iter()
-                .map(|page| format!("\"{}\"", page.title))
+                .map(|page| page.to_string())
                 .collect::<Vec<String>>()
                 .join(", ")
         ));
@@ -168,16 +180,25 @@ async fn main() -> Result<(), Error> {
         let shared_explore_regex = Arc::new(Mutex::new(
             Regex::new(r#"(?m)"\/wiki\/([^"\/]+?)(?:#.+?)?"[ >]"#).unwrap(),
         ));
+        let shared_explored_count = Arc::new(Mutex::new(0 as usize));
 
         println_and_log(&format!("spawning threads"));
 
         unexplored_pages.into_iter().for_each(|page| {
             let thread_explore_regex = Arc::clone(&shared_explore_regex);
+            let thread_explored_count = Arc::clone(&shared_explored_count);
             let child = tokio::spawn(async move {
-                let explore_result = explore(&page.title, thread_explore_regex).await;
+                let explore_result = explore(&page, thread_explore_regex).await;
+                let count = {
+                    let mut tmp = thread_explored_count.lock().unwrap();
+                    (*tmp).add_assign(1);
+                    *tmp
+                };
                 print!(
-                    "waiting for threads to finish 0/{} (0%)    \r",
-                    max_concurrent_pages
+                    "explored {}/{} pages ({}%)      \r",
+                    count,
+                    max_concurrent_pages,
+                    100 * count / max_concurrent_pages
                 );
                 std::io::stdout().flush().unwrap();
                 match explore_result {
@@ -188,10 +209,7 @@ async fn main() -> Result<(), Error> {
             children.push(child);
         });
 
-        print!(
-            "waiting for threads to finish 0/{} (0%)    \r",
-            max_concurrent_pages
-        );
+        print!("explored 0/0 pages (0%)      \r");
         std::io::stdout().flush().unwrap();
         for child in children.into_iter() {
             let child_result = child.await;
@@ -212,7 +230,7 @@ async fn main() -> Result<(), Error> {
         ));
 
         // mark as bugged if there are
-        if bugged_pages.len() > 0 {
+        if !bugged_pages.is_empty() {
             last_query = format!(
                 "UPDATE Pages SET bugged = TRUE WHERE id IN ({});",
                 bugged_pages
@@ -301,7 +319,7 @@ async fn main() -> Result<(), Error> {
                             (*count).sub_assign(1);
                             (now.elapsed().as_millis(), *count)
                         };
-                        print!("{} pages left to explore ({}ms)      \r", count, elapsed);
+                        print!("{} pages left to explore ({}ms)         \r", count, elapsed);
                         thread_pages.push((link.to_string(), page));
                     }
                     thread_pages
@@ -317,7 +335,7 @@ async fn main() -> Result<(), Error> {
                 .collect::<Vec<(String, Page)>>();
 
             println_and_log(&format!(
-                "found {} pages ({}ms)",
+                "found {} pages ({}ms)               ",
                 found_pages.len(),
                 shared_now.lock().unwrap().elapsed().as_millis()
             ));
@@ -420,7 +438,7 @@ async fn main() -> Result<(), Error> {
                 })
                 .flatten()
                 .collect::<HashSet<(&Page, &Page)>>();
-            println_and_log(&format!("({} relations)", relations_found.len()));
+            println_and_log(&format!("generated {} relations", relations_found.len()));
 
             // insert the new relations
             last_query = format!(
@@ -437,7 +455,7 @@ async fn main() -> Result<(), Error> {
                 error_and_log(&format!("\nlast query: {}", last_query));
                 return Err(insert_relations.unwrap_err());
             }
-            println_and_log(&format!("({} relations)", relations_found.len()));
+            println_and_log(&format!("inserted {} relations", relations_found.len()));
             total_links += relations_found.len();
         }
 
@@ -524,16 +542,13 @@ fn get_env() -> Result<(String, usize, usize), Error> {
     ))
 }
 
-async fn explore(url: &String, regex: Arc<Mutex<Regex>>) -> Result<Vec<String>, Error> {
-    let request = format!(
-        "https://fr.m.wikipedia.org/wiki/{}",
-        format_url_for_reqwest(url)
-    );
+async fn explore(page: &Page, regex: Arc<Mutex<Regex>>) -> Result<Vec<String>, Error> {
+    let request = format!("https://fr.m.wikipedia.org/?curid={}", page.id);
 
     let body = reqwest::get(request.clone())
         .await
         .unwrap_or_else(|error| {
-            println!("{}", url);
+            println!("{}", page.title);
             panic!("{}", error);
         })
         .text()
@@ -553,11 +568,6 @@ async fn explore(url: &String, regex: Arc<Mutex<Regex>>) -> Result<Vec<String>, 
             .collect::<HashSet<String>>()
     };
 
-    if found_links.is_empty() {
-        error_and_log(&format!("No links found in: {}", request));
-        std::process::exit(0);
-    }
-
     let filtered_links = found_links
         .into_iter()
         .filter(|link| {
@@ -568,8 +578,10 @@ async fn explore(url: &String, regex: Arc<Mutex<Regex>>) -> Result<Vec<String>, 
         .collect::<Vec<String>>();
 
     if filtered_links.is_empty() {
-        error_and_log(&format!("No links found in: {}", request));
-        std::process::exit(0);
+        warn_and_log(&format!(
+            "No links found in Page {{ id: {}, title: \"{}\" }}",
+            page.id, page.title
+        ));
     }
 
     Ok(filtered_links)
