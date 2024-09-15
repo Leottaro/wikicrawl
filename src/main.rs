@@ -56,7 +56,7 @@ const RETRY_COOLDOWN: u64 = 1;
 #[derive(Debug)]
 struct Page {
     id: usize,
-    url: String,
+    title: String,
 }
 impl PartialEq for Page {
     fn eq(&self, other: &Self) -> bool {
@@ -135,11 +135,11 @@ async fn main() -> Result<(), Error> {
     } {
         // get unexplored pages
         last_query = format!(
-            "SELECT id, url FROM Pages WHERE explored = false AND bugged = false ORDER BY id ASC LIMIT {};",
+            "SELECT id, title FROM Pages WHERE explored = false AND bugged = false ORDER BY id ASC LIMIT {};",
             max_concurrent_pages
         );
         println_and_log("getting unexplored pages");
-        let unexplored_result = connection.query_map(&last_query, |(id, url)| Page { id, url });
+        let unexplored_result = connection.query_map(&last_query, |(id, title)| Page { id, title });
         if unexplored_result.is_err() {
             error_and_log(&format!("\nlast query: {}", last_query));
             return Err(unexplored_result.unwrap_err());
@@ -157,7 +157,7 @@ async fn main() -> Result<(), Error> {
             "Exploring pages: {}",
             unexplored_pages
                 .iter()
-                .map(|page| format!("\"{}\"", page.url))
+                .map(|page| format!("\"{}\"", page.title))
                 .collect::<Vec<String>>()
                 .join(", ")
         ));
@@ -174,7 +174,7 @@ async fn main() -> Result<(), Error> {
         unexplored_pages.into_iter().for_each(|page| {
             let thread_explore_regex = Arc::clone(&shared_explore_regex);
             let child = tokio::spawn(async move {
-                let explore_result = explore(&page.url, thread_explore_regex).await;
+                let explore_result = explore(&page.title, thread_explore_regex).await;
                 print!(
                     "waiting for threads to finish 0/{} (0%)    \r",
                     max_concurrent_pages
@@ -241,16 +241,16 @@ async fn main() -> Result<(), Error> {
         if found_links.len() > 0 {
             let now = Instant::now();
             last_query = format!(
-			"SELECT Alias.alias, Pages.id, Pages.url FROM Pages JOIN Alias ON Pages.id = Alias.id WHERE alias IN ({});", 
+			"SELECT Alias.alias, Pages.id, Pages.title FROM Pages JOIN Alias ON Pages.id = Alias.id WHERE alias IN ({});", 
 			found_links
 				.iter()
 				.map(|link| format!("\"{}\"", format_link_for_mysql(link)))
 				.collect::<Vec<String>>()
 				.join(", "));
-            let old_pages_result = connection
-                .query_map(&last_query, |(alias, id, url): (String, usize, String)| {
-                    (alias, Page { id, url })
-                });
+            let old_pages_result = connection.query_map(
+                &last_query,
+                |(alias, id, title): (String, usize, String)| (alias, Page { id, title }),
+            );
             if old_pages_result.is_err() {
                 error_and_log(&format!("\nlast query: {}", last_query));
                 return Err(old_pages_result.unwrap_err());
@@ -362,13 +362,13 @@ async fn main() -> Result<(), Error> {
             if added_pages > 0 {
                 total_pages += added_pages;
                 last_query = format!(
-                    "INSERT INTO Pages (id, url) VALUES {};",
+                    "INSERT INTO Pages (id, title) VALUES {};",
                     unique_new_pages
                         .into_iter()
                         .map(|page| format!(
                             "({}, \"{}\")",
                             page.id,
-                            format_link_for_mysql(&page.url)
+                            format_link_for_mysql(&page.title)
                         ))
                         .collect::<Vec<String>>()
                         .join(",")
@@ -412,8 +412,8 @@ async fn main() -> Result<(), Error> {
                 .map(|(page, links)| {
                     links
                         .iter()
-                        .filter_map(|url| {
-                            let linked = old_pages.get(url).or(new_pages.get(url));
+                        .filter_map(|link| {
+                            let linked = old_pages.get(link).or(new_pages.get(link));
                             linked.map(|link| (page, link))
                         })
                         .collect::<HashSet<(&Page, &Page)>>()
@@ -617,7 +617,7 @@ async fn extract_link_info_api(
         match captures {
             Some(capture) => {
                 return Page {
-                    url: capture.get(1).unwrap().as_str().replace("\\\"", "\""),
+                    title: capture.get(1).unwrap().as_str().replace("\\\"", "\""),
                     id: capture.get(2).unwrap().as_str().parse::<usize>().unwrap(),
                 };
             }
@@ -650,7 +650,7 @@ async fn extract_link_info_web(url: &String, regex: &Arc<Mutex<Regex>>) -> Page 
         match captures {
             Some(capture) => {
                 return Page {
-                    url: capture.get(1).unwrap().as_str().to_string(),
+                    title: capture.get(1).unwrap().as_str().to_string(),
                     id: capture.get(2).unwrap().as_str().parse::<usize>().unwrap(),
                 };
             }
