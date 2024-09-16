@@ -174,15 +174,28 @@ async fn main() -> Result<(), Error> {
                 .join(", ")
         ));
 
+        // delete potential links from an old run
+        println_and_log("deleting potential links from an old run");
+        last_query = format!(
+            "DELETE FROM Links WHERE linker IN ({});",
+            unexplored_pages
+                .iter()
+                .map(|page| page.id.to_string())
+                .collect::<Vec<String>>()
+                .join(", ")
+        );
+        connection.query_drop(&last_query).unwrap();
+
         let mut results: Vec<(Page, Vec<String>)> = Vec::new();
         let mut bugged_pages: Vec<Page> = Vec::new();
         let mut children: Vec<JoinHandle<(Page, Option<Vec<String>>)>> = Vec::new();
+        let now = Instant::now();
         let shared_explore_regex = Arc::new(Mutex::new(
             Regex::new(r#"(?m)"\/wiki\/([^"\/]+?)(?:#.+?)?"[ >]"#).unwrap(),
         ));
         let shared_explored_count = Arc::new(Mutex::new(0 as usize));
 
-        println_and_log(&format!("spawning threads"));
+        println_and_log(&format!("exploring pages"));
 
         unexplored_pages.into_iter().for_each(|page| {
             let thread_explore_regex = Arc::clone(&shared_explore_regex);
@@ -202,7 +215,13 @@ async fn main() -> Result<(), Error> {
                 );
                 std::io::stdout().flush().unwrap();
                 match explore_result {
-                    Ok(links) => (page, Some(links)),
+                    Ok(links) => {
+                        if links.is_empty() {
+                            (page, None)
+                        } else {
+                            (page, Some(links))
+                        }
+                    }
                     Err(_) => (page, None),
                 }
             });
@@ -226,7 +245,9 @@ async fn main() -> Result<(), Error> {
             }
         }
         println_and_log(&format!(
-            "\rthreads finished                                "
+            "\rexplored {} pages in {} ms",
+            unexplored_length,
+            now.elapsed().as_millis()
         ));
 
         // mark as bugged if there are
@@ -319,7 +340,7 @@ async fn main() -> Result<(), Error> {
                             (*count).sub_assign(1);
                             (now.elapsed().as_millis(), *count)
                         };
-                        print!("{} pages left to explore ({}ms)         \r", count, elapsed);
+                        print!("{} pages left to find ({}ms)         \r", count, elapsed);
                         thread_pages.push((link.to_string(), page));
                     }
                     thread_pages
@@ -545,46 +566,50 @@ fn get_env() -> Result<(String, usize, usize), Error> {
 async fn explore(page: &Page, regex: Arc<Mutex<Regex>>) -> Result<Vec<String>, Error> {
     let request = format!("https://fr.m.wikipedia.org/?curid={}", page.id);
 
-    let body = reqwest::get(request.clone())
-        .await
-        .unwrap_or_else(|error| {
-            println!("{}", page.title);
-            panic!("{}", error);
-        })
-        .text()
-        .await
-        .unwrap();
+    loop {
+        let body = reqwest::get(request.clone())
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
 
-    let found_links = {
-        let owned_regex = regex.lock().unwrap();
-        (*owned_regex)
-            .captures_iter(body.as_str())
-            .map(|captures| {
-                decode(captures.get(1).unwrap().as_str())
-                    .unwrap()
-                    .into_owned()
-                    .to_ascii_lowercase()
+        if body.contains("<title>Wikimedia Error</title>") {
+            thread::sleep(Duration::from_secs(RETRY_COOLDOWN));
+            continue;
+        }
+
+        let found_links = {
+            let owned_regex = regex.lock().unwrap();
+            (*owned_regex)
+                .captures_iter(body.as_str())
+                .map(|captures| {
+                    decode(captures.get(1).unwrap().as_str())
+                        .unwrap()
+                        .into_owned()
+                        .to_ascii_lowercase()
+                })
+                .collect::<HashSet<String>>()
+        };
+
+        let filtered_links = found_links
+            .into_iter()
+            .filter(|link| {
+                !WIKIPEDIA_NAMESPACES
+                    .iter()
+                    .any(|namespace| link.starts_with(namespace))
             })
-            .collect::<HashSet<String>>()
-    };
+            .collect::<Vec<String>>();
 
-    let filtered_links = found_links
-        .into_iter()
-        .filter(|link| {
-            !WIKIPEDIA_NAMESPACES
-                .iter()
-                .any(|namespace| link.starts_with(namespace))
-        })
-        .collect::<Vec<String>>();
+        if filtered_links.is_empty() {
+            warn_and_log(&format!(
+                "No links found in Page {{ id: {}, title: \"{}\" }}",
+                page.id, page.title
+            ));
+        }
 
-    if filtered_links.is_empty() {
-        warn_and_log(&format!(
-            "No links found in Page {{ id: {}, title: \"{}\" }}",
-            page.id, page.title
-        ));
+        return Ok(filtered_links);
     }
-
-    Ok(filtered_links)
 }
 
 async fn extract_link_info_api(
