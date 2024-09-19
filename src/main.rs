@@ -9,19 +9,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::Local;
-use env_logger::Builder;
+use env_logger::Builder as EnvBuilder;
 use log::{error, info, warn, LevelFilter};
 use mysql::prelude::*;
 use mysql::*;
 use regex::Regex;
 use signal_hook::consts::SIGINT;
 use signal_hook::iterator::Signals;
+use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::task::JoinHandle;
 use urlencoding::decode;
 
 const ENV_PATH: &str = ".env";
 const ENV_DEFAULT: &str =
-    "WIKICRAWL_USER=root\nWIKICRAWL_PASSWORD=root\nWIKICRAWL_HOST=localhost\nWIKICRAWL_PORT=3306\nWIKICRAWL_CONCURRENT_PAGES=10\nWIKICRAWL_CHUNK_SIZE=200\n";
+    "WIKICRAWL_USER=root\nWIKICRAWL_PASSWORD=root\nWIKICRAWL_HOST=localhost\nWIKICRAWL_PORT=3306\nWIKICRAWL_EXPLORING_PAGES=10\nWIKICRAWL_NEW_PAGES=80\n";
 const WIKIPEDIA_NAMESPACES: [&str; 28] = [
     "média:",
     "spécial:",
@@ -88,20 +89,56 @@ async fn main() -> Result<(), Error> {
     setup_logs()?;
     println_and_log("Starting the program");
 
-    let env_result = get_env();
-    if env_result.is_err() {
-        error_and_log(&format!("{}", env_result.as_ref().unwrap_err()));
-        return Err(env_result.unwrap_err());
+    loop {
+        let mut last_query: String = String::new();
+        let result = wikicrawl(&mut last_query).await;
+        if result.is_err() {
+            error_and_log("WIKICRAWL CRASHED WITH LAST QUERY BEING");
+            error_and_log(&format!("{}", last_query));
+            error_and_log(&format!("{}", result.unwrap_err()));
+            println_and_log("program restarting in 10 seconds ...");
+            println_and_log("Press CTRL + C to stop.");
+            thread::sleep(Duration::from_secs(10));
+        } else {
+            println_and_log("WIKICRAWL FINISHED");
+            break;
+        }
     }
-    let (database_url, max_concurrent_pages, chunk_size) = env_result.unwrap();
+    return Ok(());
+}
 
+async fn wikicrawl(last_query: &mut String) -> Result<(), Error> {
+    println_and_log("getting env infos");
+    let (database_url, max_exploring_pages, max_new_pages) = get_env().unwrap();
+
+    println_and_log("creating runtimes");
+    let sigint_runtime = RuntimeBuilder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("wikicrawl sigint".to_string())
+        .build()
+        .unwrap();
+    let exploring_runtime = RuntimeBuilder::new_multi_thread()
+        .worker_threads(max_exploring_pages)
+        .enable_all()
+        .thread_name("wikicrawl exploring".to_string())
+        .build()
+        .unwrap();
+    let new_pages_runtime = RuntimeBuilder::new_multi_thread()
+        .worker_threads(max_new_pages)
+        .enable_all()
+        .thread_name("wikicrawl new_pages".to_string())
+        .build()
+        .unwrap();
+
+    println_and_log("connecting to database");
     let pool = Pool::new(database_url.clone().as_str()).unwrap();
     let mut connection = pool.get_conn().unwrap();
 
     let shared_bool = Arc::new(Mutex::new(true));
     let shared_bool_clone = Arc::clone(&shared_bool);
     let mut signals = Signals::new(&[SIGINT])?;
-    thread::spawn(move || {
+    println_and_log("creating SIGINT thread");
+    sigint_runtime.spawn(async move {
         for sig in signals.forever() {
             if sig != SIGINT {
                 continue;
@@ -118,48 +155,48 @@ async fn main() -> Result<(), Error> {
         }
     });
 
+    println_and_log("querying total explored pages");
     let mut total_explored: usize = connection
         .query_first("SELECT COUNT(*) FROM Pages WHERE explored = TRUE;")
         .unwrap_or(Some(0))
         .unwrap_or(0);
+    println_and_log("querying total bugged pages");
     let mut total_bugged: usize = connection
         .query_first("SELECT COUNT(*) FROM Pages WHERE bugged = TRUE;")
         .unwrap_or(Some(0))
         .unwrap_or(0);
+    println_and_log("querying total pages");
     let mut total_pages: usize = connection
         .query_first("SELECT COUNT(*) FROM Pages;")
         .unwrap_or(Some(0))
         .unwrap_or(0);
+    println_and_log("querying total links");
     let mut total_links: usize = connection
         .query_first("SELECT COUNT(*) FROM Links;")
         .unwrap_or(Some(0))
         .unwrap_or(0);
 
     println_and_log(&format!(
-        "\nexplored {} pages (with {} bugged) \nfound {} pages \nlisted {} links\n",
+        "explored {} pages (with {} bugged) \nfound {} pages \nlisted {} links\n",
         total_explored, total_bugged, total_pages, total_links
     ));
 
-    let mut last_query: String;
     while {
         let can_continue = shared_bool_clone.lock().unwrap();
         *can_continue
     } {
         // get unexplored pages
-        last_query = format!(
+        last_query.clear();
+        last_query.push_str(&format!(
             "SELECT id, title FROM Pages WHERE explored = false AND bugged = false ORDER BY id ASC LIMIT {};",
-            max_concurrent_pages
-        );
+            max_exploring_pages
+        ));
         println_and_log("getting unexplored pages");
-        let unexplored_result = connection.query_map(&last_query, |(id, title)| Page { id, title });
-        if unexplored_result.is_err() {
-            error_and_log(&format!("\nlast query: {}", last_query));
-            return Err(unexplored_result.unwrap_err());
-        }
-        let unexplored_pages = unexplored_result.unwrap();
+        let unexplored_pages = connection
+            .query_map(&last_query, |(id, title)| Page { id, title })
+            .unwrap();
         let unexplored_length = unexplored_pages.len();
         if unexplored_length < 1 {
-            error_and_log(&format!("\nlast query: {}", last_query));
             return Err(Error::from(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "No unexplored pages found",
@@ -176,14 +213,15 @@ async fn main() -> Result<(), Error> {
 
         // delete potential links from an old run
         println_and_log("deleting potential links from an old run");
-        last_query = format!(
+        last_query.clear();
+        last_query.push_str(&format!(
             "DELETE FROM Links WHERE linker IN ({});",
             unexplored_pages
                 .iter()
                 .map(|page| page.id.to_string())
                 .collect::<Vec<String>>()
-                .join(", ")
-        );
+                .join(", "),
+        ));
         connection.query_drop(&last_query).unwrap();
 
         let mut results: Vec<(Page, Vec<String>)> = Vec::new();
@@ -200,7 +238,7 @@ async fn main() -> Result<(), Error> {
         unexplored_pages.into_iter().for_each(|page| {
             let thread_explore_regex = Arc::clone(&shared_explore_regex);
             let thread_explored_count = Arc::clone(&shared_explored_count);
-            let child = tokio::spawn(async move {
+            let child = exploring_runtime.spawn(async move {
                 let explore_result = explore(&page, thread_explore_regex).await;
                 let count = {
                     let mut tmp = thread_explored_count.lock().unwrap();
@@ -210,8 +248,8 @@ async fn main() -> Result<(), Error> {
                 print!(
                     "explored {}/{} pages ({}%)      \r",
                     count,
-                    max_concurrent_pages,
-                    100 * count / max_concurrent_pages
+                    max_exploring_pages,
+                    100 * count / max_exploring_pages
                 );
                 std::io::stdout().flush().unwrap();
                 match explore_result {
@@ -231,14 +269,7 @@ async fn main() -> Result<(), Error> {
         print!("explored 0/0 pages (0%)      \r");
         std::io::stdout().flush().unwrap();
         for child in children.into_iter() {
-            let child_result = child.await;
-            if child_result.is_err() {
-                return Err(Error::from(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    child_result.unwrap_err(),
-                )));
-            }
-            let (page, links) = child_result.unwrap();
+            let (page, links) = child.await.unwrap();
             match links {
                 Some(links) => results.push((page, links)),
                 None => bugged_pages.push(page),
@@ -252,20 +283,17 @@ async fn main() -> Result<(), Error> {
 
         // mark as bugged if there are
         if !bugged_pages.is_empty() {
-            last_query = format!(
+            last_query.clear();
+            last_query.push_str(&format!(
                 "UPDATE Pages SET bugged = TRUE WHERE id IN ({});",
                 bugged_pages
                     .iter()
                     .map(|page| page.id.to_string())
                     .collect::<Vec<String>>()
-                    .join(",")
-            );
+                    .join(","),
+            ));
             println_and_log("marking bugged pages");
-            let bugged_result = connection.query_drop(&last_query);
-            if bugged_result.is_err() {
-                error_and_log(&format!("\nlast query: {}", last_query));
-                return Err(bugged_result.unwrap_err());
-            }
+            connection.query_drop(&last_query).unwrap();
             println_and_log(&format!("marked {} bugged pages", bugged_pages.len()));
             total_bugged += bugged_pages.len();
         }
@@ -279,22 +307,19 @@ async fn main() -> Result<(), Error> {
 
         if found_links.len() > 0 {
             let now = Instant::now();
-            last_query = format!(
+            last_query.clear();
+            last_query.push_str(&format!(
 			"SELECT Alias.alias, Pages.id, Pages.title FROM Pages JOIN Alias ON Pages.id = Alias.id WHERE alias IN ({});", 
 			found_links
 				.iter()
 				.map(|link| format!("\"{}\"", format_link_for_mysql(link)))
 				.collect::<Vec<String>>()
-				.join(", "));
-            let old_pages_result = connection.query_map(
-                &last_query,
-                |(alias, id, title): (String, usize, String)| (alias, Page { id, title }),
-            );
-            if old_pages_result.is_err() {
-                error_and_log(&format!("\nlast query: {}", last_query));
-                return Err(old_pages_result.unwrap_err());
-            }
-            let mut old_pages = old_pages_result
+				.join(", ")));
+            let mut old_pages = connection
+                .query_map(
+                    &last_query,
+                    |(alias, id, title): (String, usize, String)| (alias, Page { id, title }),
+                )
                 .unwrap()
                 .into_iter()
                 .collect::<HashMap<String, Page>>();
@@ -319,14 +344,14 @@ async fn main() -> Result<(), Error> {
 				Regex::new(r#"(?m)"wgTitle":"(.*?)",\n?"wgCurRevisionId":[0-9]+,\n?"wgRevisionId":[0-9]+,\n?"wgArticleId":([0-9]+),"#,).unwrap()
 			));
 
-            let new_pages_children = (0..chunk_size).into_iter().map(|_| {
+            let new_pages_children = (0..max_new_pages).into_iter().map(|_| {
                 let mut thread_pages: Vec<(String, Page)> = Vec::new();
                 let thread_links = Arc::clone(&shared_links);
                 let thread_count = Arc::clone(&shared_count);
                 let thread_now = Arc::clone(&shared_now);
                 let thread_api_regex = Arc::clone(&shared_api_regex);
                 let thread_web_regex = Arc::clone(&shared_web_regex);
-                tokio::spawn(async move {
+                new_pages_runtime.spawn(async move {
                     while let Some(link) = {
                         let mut links = thread_links.lock().unwrap();
                         (*links).next()
@@ -362,20 +387,16 @@ async fn main() -> Result<(), Error> {
             ));
 
             // split found_pages into new_pages and found_again_pages using the connection
-            last_query = format!(
+            last_query.clear();
+            last_query.push_str(&format!(
                 "SELECT id FROM Pages WHERE id IN ({});",
                 found_pages
                     .iter()
                     .map(|(_, page)| page.id.to_string())
                     .collect::<Vec<String>>()
-                    .join(",")
-            );
-            let found_again_result = connection.query_map(&last_query, |id: usize| id);
-            if found_again_result.is_err() {
-                error_and_log(&format!("\nlast query: {}", last_query));
-                return Err(found_again_result.unwrap_err());
-            }
-            let found_again_pages_ids = found_again_result.unwrap();
+                    .join(","),
+            ));
+            let found_again_pages_ids = connection.query_map(&last_query, |id: usize| id).unwrap();
 
             let (found_again_pages, new_pages): (HashMap<String, Page>, HashMap<String, Page>) =
                 found_pages
@@ -391,56 +412,43 @@ async fn main() -> Result<(), Error> {
                 .collect::<HashSet<&Page>>();
             let added_pages = unique_new_pages.len();
 
-            println_and_log(&format!(
-                "found {} new pages \nfound again {} old pages",
-                unique_new_pages.len(),
-                old_pages.len()
-            ));
+            println_and_log(&format!("found {} new pages", unique_new_pages.len(),));
+            println_and_log(&format!("found again {} old pages", old_pages.len()));
 
             // insert new pages
             if added_pages > 0 {
                 total_pages += added_pages;
-                last_query = format!(
+                last_query.clear();
+                last_query.push_str(&format!(
                     "INSERT INTO Pages (id, title) VALUES {};",
                     unique_new_pages
                         .into_iter()
-                        .map(|page| format!(
-                            "({}, \"{}\")",
-                            page.id,
-                            format_link_for_mysql(&page.title)
-                        ))
+                        .map(|page| {
+                            format!("({}, \"{}\")", page.id, format_link_for_mysql(&page.title))
+                        })
                         .collect::<Vec<String>>()
-                        .join(",")
-                );
+                        .join(","),
+                ));
                 println_and_log("inserting new pages");
-                let new_pages_result = connection.query_drop(&last_query);
-                if new_pages_result.is_err() {
-                    error_and_log(&format!("\nlast query: {}", last_query));
-                    return Err(new_pages_result.unwrap_err());
-                }
+                connection.query_drop(&last_query).unwrap();
                 println_and_log(&format!("inserted {} new pages", added_pages));
             }
 
             // insert aliases of new Pages
             if new_pages.len() > 0 {
-                last_query = format!(
+                last_query.clear();
+                last_query.push_str(&format!(
                     "INSERT INTO Alias (alias, id) VALUES {};",
                     new_pages
                         .iter()
-                        .map(|(alias, page)| format!(
-                            "(\"{}\",{})",
-                            format_link_for_mysql(alias),
-                            page.id
-                        ))
+                        .map(|(alias, page)| {
+                            format!("(\"{}\",{})", format_link_for_mysql(alias), page.id)
+                        })
                         .collect::<Vec<String>>()
-                        .join(",")
-                );
+                        .join(","),
+                ));
                 println_and_log("inserting aliases of found pages");
-                let new_alias_result = connection.query_drop(&last_query);
-                if new_alias_result.is_err() {
-                    error_and_log(&format!("\nlast query: {}", last_query));
-                    return Err(new_alias_result.unwrap_err());
-                }
+                connection.query_drop(&last_query).unwrap();
                 println_and_log(&format!("inserted {} aliases", new_pages.len()));
             }
 
@@ -462,47 +470,45 @@ async fn main() -> Result<(), Error> {
             println_and_log(&format!("generated {} relations", relations_found.len()));
 
             // insert the new relations
-            last_query = format!(
+            last_query.clear();
+            last_query.push_str(&format!(
                 "INSERT INTO Links (linker, linked) VALUES {};",
                 relations_found
                     .iter()
                     .map(|(linker, linked)| format!("({},{})", linker.id, linked.id))
                     .collect::<Vec<String>>()
-                    .join(", ")
-            );
+                    .join(", "),
+            ));
             println_and_log("inserting the relations ");
-            let insert_relations = connection.query_drop(&last_query);
-            if insert_relations.is_err() {
-                error_and_log(&format!("\nlast query: {}", last_query));
-                return Err(insert_relations.unwrap_err());
-            }
+            connection.query_drop(&last_query).unwrap();
             println_and_log(&format!("inserted {} relations", relations_found.len()));
             total_links += relations_found.len();
         }
 
         // mark as explored
-        last_query = format!(
+        last_query.clear();
+        last_query.push_str(&format!(
             "UPDATE Pages SET explored = TRUE WHERE id IN ({});",
             results
                 .iter()
                 .map(|(page, _)| page.id.to_string())
                 .collect::<Vec<String>>()
-                .join(", ")
-        );
+                .join(", "),
+        ));
         println_and_log("marking pages as explored ");
-        let mark_unexplored_result = connection.query_drop(&last_query);
-        if mark_unexplored_result.is_err() {
-            error_and_log(&format!("\nlast query: {}", last_query));
-            return Err(mark_unexplored_result.unwrap_err());
-        }
+        connection.query_drop(&last_query).unwrap();
         println_and_log(&format!("explored {} pages", unexplored_length));
         total_explored += unexplored_length;
 
         println_and_log(&format!(
-            "\nexplored {} pages (with {} bugged) \nfound {} pages \nlisted {} links\n",
+            "explored {} pages (with {} bugged) \nfound {} pages \nlisted {} links\n",
             total_explored, total_bugged, total_pages, total_links
         ));
     }
+
+    sigint_runtime.shutdown_background();
+    exploring_runtime.shutdown_background();
+    new_pages_runtime.shutdown_background();
 
     return Ok(());
 }
@@ -544,8 +550,8 @@ fn get_env() -> Result<(String, usize, usize), Error> {
         || !vars.contains_key("PASSWORD")
         || !vars.contains_key("HOST")
         || !vars.contains_key("PORT")
-        || !vars.contains_key("CONCURRENT_PAGES")
-        || !vars.contains_key("CHUNK_SIZE")
+        || !vars.contains_key("EXPLORING_PAGES")
+        || !vars.contains_key("NEW_PAGES")
     {
         return Err(Error::from(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -558,8 +564,8 @@ fn get_env() -> Result<(String, usize, usize), Error> {
             "mysql://{}:{}@{}:{}/wikicrawl",
             vars["USER"], vars["PASSWORD"], vars["HOST"], vars["PORT"]
         ),
-        vars["CONCURRENT_PAGES"].parse::<usize>().unwrap_or(100),
-        vars["CHUNK_SIZE"].parse::<usize>().unwrap_or(200),
+        vars["EXPLORING_PAGES"].parse::<usize>().unwrap_or(100),
+        vars["NEW_PAGES"].parse::<usize>().unwrap_or(200),
     ))
 }
 
@@ -723,13 +729,13 @@ fn setup_logs() -> Result<(), Error> {
         })
         .count();
     if this_day_logs > 0 {
-        log_name.push_str(&format!("({})", this_day_logs + 1));
+        log_name.push_str(&format!("_{}", this_day_logs + 1));
     }
 
     let target =
         Box::new(File::create(format!("logs/{}.log", log_name)).expect("Can't create file"));
 
-    Builder::new()
+    EnvBuilder::new()
         .format(|buf, record| {
             writeln!(
                 buf,
