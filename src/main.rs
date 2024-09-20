@@ -4,6 +4,7 @@ use wikicrawl::setup_wikicrawl;
 
 use std::{
     collections::HashMap,
+    env,
     io::{stdin, stdout, Error, ErrorKind, Write},
     usize,
 };
@@ -14,6 +15,13 @@ const ENV_DEFAULT: &str =
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = env::args().collect();
+    let mut command_line_argument = args
+        .get(1)
+        .unwrap_or(&"0".to_string())
+        .parse::<usize>()
+        .unwrap_or(0);
+
     let (database_url, max_exploring_pages, max_new_pages) = get_env().unwrap();
 
     println!("connecting to database");
@@ -22,15 +30,21 @@ async fn main() {
 
     let mut user_input = String::new();
     loop {
-        print!("\nWhat do you want to do ?\n1: Search the smallest path between two pages\n2: Crawl wikipedia\n3: Exit\nYou Choose: ");
-        stdout().flush().unwrap();
-        user_input.clear();
-        stdin()
-            .read_line(&mut user_input)
-            .expect("Failed to read your choice");
+        if command_line_argument == 0 {
+            print!("\nWhat do you want to do ?\n1: Search the smallest path between two pages\n2: Crawl wikipedia\n3: Exit\nYou Choose: ");
+            stdout().flush().unwrap();
+            user_input.clear();
+            stdin()
+                .read_line(&mut user_input)
+                .expect("Failed to read your choice");
+        } else {
+            user_input = command_line_argument.to_string();
+            command_line_argument = 0;
+        }
         match user_input.trim().parse::<usize>() {
             Ok(1) => {
-                println!("Not yet implemented");
+                println!("Not implemented yet");
+                return;
             }
             Ok(2) => {
                 setup_wikicrawl(&mut connection, max_exploring_pages, max_new_pages).await;
@@ -69,9 +83,9 @@ fn get_env() -> Result<(String, usize, usize), Error> {
     let env_content = env_read.unwrap();
     if env_content.is_empty() {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Error: .env file is empty, delete it to see default values or fill it with the following values:\n{}", ENV_DEFAULT),
-        ));
+				std::io::ErrorKind::InvalidData,
+				format!("Error: .env file is empty, delete it to see default values or fill it with the following values:\n{}", ENV_DEFAULT),
+			));
     }
 
     let vars = env_content
@@ -88,9 +102,9 @@ fn get_env() -> Result<(String, usize, usize), Error> {
         || !vars.contains_key("NEW_PAGES")
     {
         return Err(Error::from(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Error: .env file is missing some values, delete it to see default values or fill it with the following values:\n{}", ENV_DEFAULT),
-        )));
+				std::io::ErrorKind::InvalidData,
+				format!("Error: .env file is missing some values, delete it to see default values or fill it with the following values:\n{}", ENV_DEFAULT),
+			)));
     }
 
     Ok((
