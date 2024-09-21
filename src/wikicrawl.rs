@@ -3,14 +3,12 @@ use lib::*;
 use chrono::Local;
 use env_logger::Builder as EnvBuilder;
 use log::LevelFilter;
-use mysql::Error;
 use mysql::{prelude::*, PooledConn};
-use regex::Regex;
 use signal_hook::consts::SIGINT;
 use signal_hook::iterator::Signals;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Write;
+use std::io::{Error, ErrorKind, Write};
 use std::ops::{AddAssign, SubAssign};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -58,6 +56,7 @@ pub async fn setup_wikicrawl(
     println!("setting up logs");
     setup_logs().unwrap();
     println_and_log("Starting wikicrawl");
+
     loop {
         let mut last_query: String = String::new();
         let result = wikicrawl(
@@ -87,46 +86,6 @@ async fn wikicrawl(
     max_exploring_pages: usize,
     max_new_pages: usize,
 ) -> Result<(), Error> {
-    println_and_log("creating runtimes");
-    let sigint_runtime = RuntimeBuilder::new_multi_thread()
-        .worker_threads(1)
-        .thread_name("wikicrawl sigint".to_string())
-        .build()
-        .unwrap();
-    let exploring_runtime = RuntimeBuilder::new_multi_thread()
-        .worker_threads(max_exploring_pages)
-        .enable_all()
-        .thread_name("wikicrawl exploring".to_string())
-        .build()
-        .unwrap();
-    let new_pages_runtime = RuntimeBuilder::new_multi_thread()
-        .worker_threads(max_new_pages)
-        .enable_all()
-        .thread_name("wikicrawl new_pages".to_string())
-        .build()
-        .unwrap();
-
-    let shared_bool = Arc::new(Mutex::new(true));
-    let shared_bool_clone = Arc::clone(&shared_bool);
-    let mut signals = Signals::new(&[SIGINT])?;
-    println_and_log("creating SIGINT thread");
-    sigint_runtime.spawn(async move {
-        for sig in signals.forever() {
-            if sig != SIGINT {
-                continue;
-            }
-
-            let mut val = shared_bool.lock().unwrap();
-            if *val {
-                println_and_log("SIGINT received, waiting for the program to stop");
-                *val = false;
-            } else {
-                println_and_log("SIGINT received again, forcing the program to stop");
-                std::process::exit(0);
-            }
-        }
-    });
-
     println_and_log("querying total explored pages");
     let mut total_explored: usize = connection
         .query_first("SELECT COUNT(*) FROM Pages WHERE explored = TRUE;")
@@ -153,6 +112,27 @@ async fn wikicrawl(
         total_explored, total_bugged, total_pages, total_links
     ));
 
+    let shared_bool = Arc::new(Mutex::new(true));
+    let shared_bool_clone = Arc::clone(&shared_bool);
+    let mut signals = Signals::new(&[SIGINT])?;
+    println_and_log("creating SIGINT thread");
+    thread::spawn(move || {
+        for sig in signals.forever() {
+            if sig != SIGINT {
+                continue;
+            }
+
+            let mut val = shared_bool.lock().unwrap();
+            if *val {
+                println_and_log("SIGINT received, waiting for the program to stop");
+                *val = false;
+            } else {
+                println_and_log("SIGINT received again, forcing the program to stop");
+                std::process::exit(0);
+            }
+        }
+    });
+
     while {
         let can_continue = shared_bool_clone.lock().unwrap();
         *can_continue
@@ -166,13 +146,13 @@ async fn wikicrawl(
         println_and_log("getting unexplored pages");
         let unexplored_pages = connection
             .query_map(&last_query, |(id, title)| Page { id, title })
-            .unwrap();
+            .map_err(|err| Error::new(ErrorKind::Other, err))?;
         let unexplored_length = unexplored_pages.len();
         if unexplored_length < 1 {
-            return Err(Error::from(std::io::Error::new(
+            return Err(Error::new(
                 std::io::ErrorKind::NotFound,
                 "No unexplored pages found",
-            )));
+            ));
         }
         println_and_log(&format!(
             "Exploring pages: [{}]",
@@ -194,24 +174,28 @@ async fn wikicrawl(
                 .collect::<Vec<String>>()
                 .join(", "),
         ));
-        connection.query_drop(&last_query).unwrap();
+        connection
+            .query_drop(&last_query)
+            .map_err(|err| Error::new(ErrorKind::Other, err))?;
 
         let mut results: Vec<(Page, Vec<String>)> = Vec::new();
         let mut bugged_pages: Vec<Page> = Vec::new();
         let mut children: Vec<JoinHandle<(Page, Option<Vec<String>>)>> = Vec::new();
         let now = Instant::now();
-        let shared_explore_regex = Arc::new(Mutex::new(
-            Regex::new(r#"(?m)"\/wiki\/([^"\/]+?)(?:#.+?)?"[ >]"#).unwrap(),
-        ));
         let shared_explored_count = Arc::new(Mutex::new(0 as usize));
 
         println_and_log(&format!("exploring pages"));
 
+        let exploring_runtime = RuntimeBuilder::new_multi_thread()
+            .worker_threads(unexplored_length)
+            .enable_all()
+            .thread_name("wikicrawl exploring".to_string())
+            .build()?;
+
         unexplored_pages.into_iter().for_each(|page| {
-            let thread_explore_regex = Arc::clone(&shared_explore_regex);
             let thread_explored_count = Arc::clone(&shared_explored_count);
             let child = exploring_runtime.spawn(async move {
-                let explore_result = explore(&page, thread_explore_regex).await;
+                let explore_result = explore(&page).await;
                 let count = {
                     let mut tmp = thread_explored_count.lock().unwrap();
                     (*tmp).add_assign(1);
@@ -239,14 +223,16 @@ async fn wikicrawl(
         });
 
         print!("explored 0/0 pages (0%)      \r");
-        std::io::stdout().flush().unwrap();
+        std::io::stdout().flush()?;
         for child in children.into_iter() {
-            let (page, links) = child.await.unwrap();
+            let (page, links) = child.await?;
             match links {
                 Some(links) => results.push((page, links)),
                 None => bugged_pages.push(page),
             }
         }
+        exploring_runtime.shutdown_background();
+
         println_and_log(&format!(
             "explored {} pages in {} ms",
             unexplored_length,
@@ -265,7 +251,9 @@ async fn wikicrawl(
                     .join(","),
             ));
             println_and_log("marking bugged pages");
-            connection.query_drop(&last_query).unwrap();
+            connection
+                .query_drop(&last_query)
+                .map_err(|err| Error::new(ErrorKind::Other, err))?;
             println_and_log(&format!("marked {} bugged pages", bugged_pages.len()));
             total_bugged += bugged_pages.len();
         }
@@ -292,7 +280,7 @@ async fn wikicrawl(
                     &last_query,
                     |(alias, id, title): (String, usize, String)| (alias, Page { id, title }),
                 )
-                .unwrap()
+                .map_err(|err| Error::new(ErrorKind::Other, err))?
                 .into_iter()
                 .collect::<HashMap<String, Page>>();
 
@@ -309,6 +297,15 @@ async fn wikicrawl(
             let shared_count = Arc::new(Mutex::new(new_links.len()));
             let shared_links = Arc::new(Mutex::new(new_links.into_iter()));
             let shared_now = Arc::new(Mutex::new(Instant::now()));
+
+            let new_pages_runtime = RuntimeBuilder::new_multi_thread()
+                .worker_threads(max_new_pages.max({
+                    let count = shared_count.lock().unwrap();
+                    *count
+                }))
+                .enable_all()
+                .thread_name("wikicrawl new_pages".to_string())
+                .build()?;
 
             let new_pages_children = (0..max_new_pages).into_iter().map(|_| {
                 let mut thread_pages: Vec<(String, Page)> = Vec::new();
@@ -342,6 +339,8 @@ async fn wikicrawl(
                 .flatten()
                 .collect::<Vec<(String, Page)>>();
 
+            new_pages_runtime.shutdown_background();
+
             println_and_log(&format!(
                 "found {} pages ({}ms)               ",
                 found_pages.len(),
@@ -358,7 +357,9 @@ async fn wikicrawl(
                     .collect::<Vec<String>>()
                     .join(","),
             ));
-            let found_again_pages_ids = connection.query_map(&last_query, |id: usize| id).unwrap();
+            let found_again_pages_ids = connection
+                .query_map(&last_query, |id: usize| id)
+                .map_err(|err| Error::new(ErrorKind::Other, err))?;
 
             let (found_again_pages, new_pages): (HashMap<String, Page>, HashMap<String, Page>) =
                 found_pages
@@ -392,7 +393,9 @@ async fn wikicrawl(
                         .join(","),
                 ));
                 println_and_log("inserting new pages");
-                connection.query_drop(&last_query).unwrap();
+                connection
+                    .query_drop(&last_query)
+                    .map_err(|err| Error::new(ErrorKind::Other, err))?;
                 println_and_log(&format!("inserted {} new pages", added_pages));
             }
 
@@ -410,7 +413,9 @@ async fn wikicrawl(
                         .join(","),
                 ));
                 println_and_log("inserting aliases of found pages");
-                connection.query_drop(&last_query).unwrap();
+                connection
+                    .query_drop(&last_query)
+                    .map_err(|err| Error::new(ErrorKind::Other, err))?;
                 println_and_log(&format!("inserted {} aliases", new_pages.len()));
             }
 
@@ -442,7 +447,9 @@ async fn wikicrawl(
                     .join(", "),
             ));
             println_and_log("inserting the relations ");
-            connection.query_drop(&last_query).unwrap();
+            connection
+                .query_drop(&last_query)
+                .map_err(|err| Error::new(ErrorKind::Other, err))?;
             println_and_log(&format!("inserted {} relations", relations_found.len()));
             total_links += relations_found.len();
         }
@@ -458,7 +465,9 @@ async fn wikicrawl(
                 .join(", "),
         ));
         println_and_log("marking pages as explored ");
-        connection.query_drop(&last_query).unwrap();
+        connection
+            .query_drop(&last_query)
+            .map_err(|err| Error::new(ErrorKind::Other, err))?;
         println_and_log(&format!("explored {} pages", unexplored_length));
         total_explored += unexplored_length;
 
@@ -468,17 +477,16 @@ async fn wikicrawl(
         ));
     }
 
-    sigint_runtime.shutdown_background();
-    exploring_runtime.shutdown_background();
-    new_pages_runtime.shutdown_background();
-
     return Ok(());
 }
 
-async fn explore(page: &Page, regex: Arc<Mutex<Regex>>) -> Result<Vec<String>, Error> {
+async fn explore(page: &Page) -> Result<Vec<String>, Error> {
     let request = format!("https://fr.m.wikipedia.org/?curid={}", page.id);
 
+    let mut retry_cooldown = RETRY_COOLDOWN.clone();
+    let delta_t = Duration::from_secs(1);
     loop {
+        retry_cooldown.add_assign(delta_t);
         let body = CLIENT
             .get(request.clone())
             .send()
@@ -490,22 +498,19 @@ async fn explore(page: &Page, regex: Arc<Mutex<Regex>>) -> Result<Vec<String>, E
 
         if body.contains("<title>Wikimedia Error</title>") {
             warn_and_log(&format!("exploring {} throwed wikimedia error", page));
-            thread::sleep(RETRY_COOLDOWN);
+            thread::sleep(retry_cooldown);
             continue;
         }
 
-        let found_links = {
-            let owned_regex = regex.lock().unwrap();
-            (*owned_regex)
-                .captures_iter(body.as_str())
-                .map(|captures| {
-                    decode(captures.get(1).unwrap().as_str())
-                        .unwrap()
-                        .into_owned()
-                        .to_ascii_lowercase()
-                })
-                .collect::<HashSet<String>>()
-        };
+        let found_links = EXPLORE_REGEX
+            .captures_iter(body.as_str())
+            .map(|captures| {
+                decode(captures.get(1).unwrap().as_str())
+                    .unwrap()
+                    .into_owned()
+                    .to_ascii_lowercase()
+            })
+            .collect::<HashSet<String>>();
 
         let filtered_links = found_links
             .into_iter()

@@ -1,6 +1,6 @@
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
-use std::ops::Mul;
+use std::ops::{AddAssign, Mul};
 use std::time::Duration;
 
 use log::{error, info, warn};
@@ -44,6 +44,7 @@ use lazy_static::lazy_static;
 lazy_static! {
     static ref API_REGEX: Regex = Regex::new(r#","title":"(.+)","pageid":([0-9]+),"#).unwrap();
     static ref WEB_REGEX: Regex = Regex::new(r#"(?m)"wgTitle":"(.*?)",\n?"wgCurRevisionId":[0-9]+,\n?"wgRevisionId":[0-9]+,\n?"wgArticleId":([0-9]+),"#).unwrap();
+    pub static ref EXPLORE_REGEX: Regex = Regex::new(r#"(?m)"\/wiki\/([^"\/]+?)(?:#.+?)?"[ >]"#).unwrap();
     pub static ref CLIENT: Client = ClientBuilder::new().connect_timeout(RETRY_COOLDOWN.mul(10)).connection_verbose(true).build().unwrap();
 }
 
@@ -58,7 +59,10 @@ pub async fn extract_link_info_api(url: &str) -> Page {
         return extract_link_info_web(url).await;
     }
 
+    let mut retry_cooldown = RETRY_COOLDOWN.clone();
+    let delta_t = Duration::from_secs(1);
     loop {
+        retry_cooldown.add_assign(delta_t);
         let body = CLIENT
             .get(&request)
             .send()
@@ -74,13 +78,16 @@ pub async fn extract_link_info_api(url: &str) -> Page {
                 "link info api of url {} throwed wikimedia error",
                 url
             ));
-            std::thread::sleep(RETRY_COOLDOWN);
+            std::thread::sleep(retry_cooldown);
             continue;
         }
 
         if !body.starts_with("{\"batchcomplete\":true,") || body.ends_with("\"search\":[]}}") {
             // à envoyer au web
-            warn_and_log(&format!("API can't find #\"{}\"#", request));
+            warn_and_log(&format!(
+                "API can't find #\"{}\"# with body\n{}",
+                request, body
+            ));
             return extract_link_info_web(url).await;
         }
 

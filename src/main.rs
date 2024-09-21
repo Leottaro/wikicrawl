@@ -1,5 +1,6 @@
-pub mod wikicrawl;
 use mysql::Pool;
+
+pub mod wikicrawl;
 use wikicrawl::setup_wikicrawl;
 
 use std::{
@@ -15,6 +16,7 @@ const ENV_DEFAULT: &str =
 
 #[tokio::main]
 async fn main() {
+    std::env::set_var("RUST_BACKTRACE", "1");
     let args: Vec<String> = env::args().collect();
     let mut command_line_argument = args
         .get(1)
@@ -42,22 +44,15 @@ async fn main() {
             command_line_argument = 0;
         }
         match user_input.trim().parse::<usize>() {
-            Ok(1) => {
-                println!("Not implemented yet");
-                return;
-            }
-            Ok(2) => {
-                setup_wikicrawl(&mut connection, max_exploring_pages, max_new_pages).await;
-                return;
-            }
-            Ok(3) => {
-                println!("Exiting the program");
-                return;
-            }
+            Ok(1) => println!("Wikipath is not implemented yet"),
+            Ok(2) => setup_wikicrawl(&mut connection, max_exploring_pages, max_new_pages).await,
+            Ok(3) => println!("Exiting the program"),
             _ => {
                 println!("Please enter a valid number.");
+                continue;
             }
         }
+        return;
     }
 }
 
@@ -82,8 +77,8 @@ fn get_env() -> Result<(String, usize, usize), Error> {
 
     let env_content = env_read.unwrap();
     if env_content.is_empty() {
-        return Err(std::io::Error::new(
-				std::io::ErrorKind::InvalidData,
+        return Err(Error::new(
+				ErrorKind::InvalidData,
 				format!("Error: .env file is empty, delete it to see default values or fill it with the following values:\n{}", ENV_DEFAULT),
 			));
     }
@@ -101,10 +96,10 @@ fn get_env() -> Result<(String, usize, usize), Error> {
         || !vars.contains_key("EXPLORING_PAGES")
         || !vars.contains_key("NEW_PAGES")
     {
-        return Err(Error::from(std::io::Error::new(
+        return Err(std::io::Error::new(
 				std::io::ErrorKind::InvalidData,
 				format!("Error: .env file is missing some values, delete it to see default values or fill it with the following values:\n{}", ENV_DEFAULT),
-			)));
+			));
     }
 
     Ok((
@@ -112,7 +107,7 @@ fn get_env() -> Result<(String, usize, usize), Error> {
             "mysql://{}:{}@{}:{}/wikicrawl",
             vars["USER"], vars["PASSWORD"], vars["HOST"], vars["PORT"]
         ),
-        vars["EXPLORING_PAGES"].parse::<usize>().unwrap_or(100),
-        vars["NEW_PAGES"].parse::<usize>().unwrap_or(200),
+        vars["EXPLORING_PAGES"].parse::<usize>().unwrap_or(75),
+        vars["NEW_PAGES"].parse::<usize>().unwrap_or(80),
     ))
 }
