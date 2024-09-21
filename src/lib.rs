@@ -1,9 +1,11 @@
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
+use std::ops::Mul;
 use std::time::Duration;
 
 use log::{error, info, warn};
 use regex::Regex;
+use reqwest::{Client, ClientBuilder};
 
 #[derive(Debug)]
 pub struct Page {
@@ -36,12 +38,14 @@ impl Display for Page {
 
 // NEW PAGES
 
+pub const RETRY_COOLDOWN: Duration = Duration::from_secs(3);
+
 use lazy_static::lazy_static;
 lazy_static! {
     static ref API_REGEX: Regex = Regex::new(r#","title":"(.+)","pageid":([0-9]+),"#).unwrap();
     static ref WEB_REGEX: Regex = Regex::new(r#"(?m)"wgTitle":"(.*?)",\n?"wgCurRevisionId":[0-9]+,\n?"wgRevisionId":[0-9]+,\n?"wgArticleId":([0-9]+),"#).unwrap();
+    pub static ref CLIENT: Client = ClientBuilder::new().connect_timeout(RETRY_COOLDOWN.mul(10)).connection_verbose(true).build().unwrap();
 }
-pub const RETRY_COOLDOWN: u64 = 1;
 
 pub async fn extract_link_info_api(url: &str) -> Page {
     let formatted_url = format_url_for_api_reqwest(url);
@@ -55,7 +59,9 @@ pub async fn extract_link_info_api(url: &str) -> Page {
     }
 
     loop {
-        let body = reqwest::get(&request)
+        let body = CLIENT
+            .get(&request)
+            .send()
             .await
             .unwrap()
             .text()
@@ -64,7 +70,11 @@ pub async fn extract_link_info_api(url: &str) -> Page {
             .replace("\n", "");
 
         if !body.starts_with('{') {
-            std::thread::sleep(Duration::from_secs(RETRY_COOLDOWN));
+            warn_and_log(&format!(
+                "link info api of url {} throwed wikimedia error",
+                url
+            ));
+            std::thread::sleep(RETRY_COOLDOWN);
             continue;
         }
 
@@ -95,30 +105,31 @@ async fn extract_link_info_web(url: &str) -> Page {
         "https://fr.m.wikipedia.org/wiki/Spécial:Recherche/{}",
         format_url_for_reqwest(url)
     );
-    loop {
-        let body = reqwest::get(&request)
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap()
-            .replace("\n", "");
 
-        let captures = WEB_REGEX.captures(&body);
-        match captures {
-            Some(capture) => {
-                return Page {
-                    title: capture.get(1).unwrap().as_str().to_string(),
-                    id: capture.get(2).unwrap().as_str().parse::<usize>().unwrap(),
-                };
-            }
-            None => {
-                error_and_log(&format!(
-                    "error: no match in body for url {}: \n{}\n\n\n",
-                    url, body
-                ));
-                std::process::exit(0);
-            }
+    let body = CLIENT
+        .get(&request)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+        .replace("\n", "");
+
+    let captures = WEB_REGEX.captures(&body);
+    match captures {
+        Some(capture) => {
+            return Page {
+                title: capture.get(1).unwrap().as_str().to_string(),
+                id: capture.get(2).unwrap().as_str().parse::<usize>().unwrap(),
+            };
+        }
+        None => {
+            error_and_log(&format!(
+                "no match in body for url {}: \n{}\n\n\n",
+                url, body
+            ));
+            std::process::exit(0);
         }
     }
 }

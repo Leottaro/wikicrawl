@@ -248,7 +248,7 @@ async fn wikicrawl(
             }
         }
         println_and_log(&format!(
-            "\rexplored {} pages in {} ms",
+            "explored {} pages in {} ms",
             unexplored_length,
             now.elapsed().as_millis()
         ));
@@ -479,7 +479,9 @@ async fn explore(page: &Page, regex: Arc<Mutex<Regex>>) -> Result<Vec<String>, E
     let request = format!("https://fr.m.wikipedia.org/?curid={}", page.id);
 
     loop {
-        let body = reqwest::get(request.clone())
+        let body = CLIENT
+            .get(request.clone())
+            .send()
             .await
             .unwrap()
             .text()
@@ -487,7 +489,8 @@ async fn explore(page: &Page, regex: Arc<Mutex<Regex>>) -> Result<Vec<String>, E
             .unwrap();
 
         if body.contains("<title>Wikimedia Error</title>") {
-            thread::sleep(Duration::from_secs(RETRY_COOLDOWN));
+            warn_and_log(&format!("exploring {} throwed wikimedia error", page));
+            thread::sleep(RETRY_COOLDOWN);
             continue;
         }
 
