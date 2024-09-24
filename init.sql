@@ -1,6 +1,5 @@
 DROP TABLE IF EXISTS Links;
 DROP TABLE IF EXISTS Alias;
-DROP INDEX IF EXISTS page_index ON Pages;
 DROP TABLE IF EXISTS Pages;
 
 CREATE TABLE IF NOT EXISTS Pages (
@@ -10,7 +9,7 @@ CREATE TABLE IF NOT EXISTS Pages (
   bugged BOOLEAN DEFAULT false,
   PRIMARY KEY (id)
 );
-CREATE INDEX IF NOT EXISTS page_index ON Pages(id);
+CREATE INDEX page_index ON Pages(id);
 
 CREATE TABLE IF NOT EXISTS Alias (
   alias VARCHAR(255) COLLATE utf8mb4_bin UNIQUE NOT NULL,
@@ -21,10 +20,10 @@ CREATE TABLE IF NOT EXISTS Alias (
 
 CREATE TABLE IF NOT EXISTS Links (
   linker INT UNSIGNED NOT NULL,
-  linked INT UNQIGNED NOT NULL,
+  linked INT UNSIGNED NOT NULL,
   PRIMARY KEY (linker, linked),
   FOREIGN KEY (linker) REFERENCES Pages(id),
   FOREIGN KEY (linked) REFERENCES Pages(id)
 );
 
-INSERT INTO Pages (id, url) VALUES (1095, "France");
+INSERT INTO Pages (id, title) VALUES (1095, "France");

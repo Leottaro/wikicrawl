@@ -1,8 +1,7 @@
-use mysql::Pool;
-
 pub mod wikicrawl;
 use wikicrawl::setup_wikicrawl;
 
+use mysql::Pool;
 use std::{
     collections::HashMap,
     env,
@@ -102,11 +101,20 @@ fn get_env() -> Result<(String, usize, usize), Error> {
 			));
     }
 
-    Ok((
+    let connection_url = if vars["PASSWORD"].is_empty() {
+        format!(
+            "mysql://{}@{}:{}/wikicrawl",
+            vars["USER"], vars["HOST"], vars["PORT"]
+        )
+    } else {
         format!(
             "mysql://{}:{}@{}:{}/wikicrawl",
             vars["USER"], vars["PASSWORD"], vars["HOST"], vars["PORT"]
-        ),
+        )
+    };
+
+    Ok((
+        connection_url,
         vars["EXPLORING_PAGES"].parse::<usize>().unwrap_or(75),
         vars["NEW_PAGES"].parse::<usize>().unwrap_or(80),
     ))

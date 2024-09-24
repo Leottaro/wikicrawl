@@ -4,17 +4,15 @@ use chrono::Local;
 use env_logger::Builder as EnvBuilder;
 use log::LevelFilter;
 use mysql::{prelude::*, PooledConn};
-use signal_hook::consts::SIGINT;
-use signal_hook::iterator::Signals;
 use std::collections::{HashMap, HashSet};
+use std::error::Error;
 use std::fs::File;
-use std::io::{Error, ErrorKind, Write};
+use std::io::Write;
 use std::ops::{AddAssign, SubAssign};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::task::JoinHandle;
+use tokio::time::{self, Duration, Instant};
 use urlencoding::decode;
 
 const WIKIPEDIA_NAMESPACES: [&str; 28] = [
@@ -58,21 +56,28 @@ pub async fn setup_wikicrawl(
     println_and_log("Starting wikicrawl");
 
     loop {
+        let sigint_cancel = Arc::new(Mutex::new(false));
         let mut last_query: String = String::new();
         let result = wikicrawl(
             &mut last_query,
+            &sigint_cancel,
             connection,
             max_exploring_pages,
             max_new_pages,
         )
         .await;
+        *sigint_cancel.lock().unwrap() = true;
         if result.is_err() {
-            error_and_log("WIKICRAWL CRASHED WITH LAST QUERY BEING");
-            error_and_log(&format!("{}", last_query));
+            if !last_query.is_empty() {
+                error_and_log("WIKICRAWL CRASHED WITH LAST QUERY BEING");
+                error_and_log(&format!("{}", last_query));
+            } else {
+                error_and_log("WIKICRAWL CRASHED");
+            }
             error_and_log(&format!("{}", result.unwrap_err()));
             println_and_log("program restarting in 10 seconds ...");
             println_and_log("Press CTRL + C to stop.");
-            thread::sleep(Duration::from_secs(10));
+            time::sleep(Duration::from_secs(10)).await;
         } else {
             println_and_log("WIKICRAWL FINISHED");
             return ();
@@ -82,10 +87,11 @@ pub async fn setup_wikicrawl(
 
 async fn wikicrawl(
     last_query: &mut String,
+    sigint_cancel: &Arc<Mutex<bool>>,
     connection: &mut PooledConn,
     max_exploring_pages: usize,
     max_new_pages: usize,
-) -> Result<(), Error> {
+) -> Result<(), Box<dyn Error>> {
     println_and_log("querying total explored pages");
     let mut total_explored: usize = connection
         .query_first("SELECT COUNT(*) FROM Pages WHERE explored = TRUE;")
@@ -112,30 +118,15 @@ async fn wikicrawl(
         total_explored, total_bugged, total_pages, total_links
     ));
 
-    let shared_bool = Arc::new(Mutex::new(true));
-    let shared_bool_clone = Arc::clone(&shared_bool);
-    let mut signals = Signals::new(&[SIGINT])?;
-    println_and_log("creating SIGINT thread");
-    thread::spawn(move || {
-        for sig in signals.forever() {
-            if sig != SIGINT {
-                continue;
-            }
-
-            let mut val = shared_bool.lock().unwrap();
-            if *val {
-                println_and_log("SIGINT received, waiting for the program to stop");
-                *val = false;
-            } else {
-                println_and_log("SIGINT received again, forcing the program to stop");
-                std::process::exit(0);
-            }
-        }
-    });
+    {
+        println_and_log("creating SIGINT thread");
+        let sigint_cancel_clone = Arc::clone(sigint_cancel);
+        ctrlc::set_handler(move || sigint_detect(&sigint_cancel_clone))?;
+    }
 
     while {
-        let can_continue = shared_bool_clone.lock().unwrap();
-        *can_continue
+        let temp = sigint_cancel.lock().unwrap();
+        !*temp
     } {
         // get unexplored pages
         last_query.clear();
@@ -144,15 +135,11 @@ async fn wikicrawl(
             max_exploring_pages
         ));
         println_and_log("getting unexplored pages");
-        let unexplored_pages = connection
-            .query_map(&last_query, |(id, title)| Page { id, title })
-            .map_err(|err| Error::new(ErrorKind::Other, err))?;
+        let unexplored_pages =
+            connection.query_map(&last_query, |(id, title)| Page { id, title })?;
         let unexplored_length = unexplored_pages.len();
         if unexplored_length < 1 {
-            return Err(Error::new(
-                std::io::ErrorKind::NotFound,
-                "No unexplored pages found",
-            ));
+            return Err(Box::from("No unexplored pages found"));
         }
         println_and_log(&format!(
             "Exploring pages: [{}]",
@@ -174,9 +161,7 @@ async fn wikicrawl(
                 .collect::<Vec<String>>()
                 .join(", "),
         ));
-        connection
-            .query_drop(&last_query)
-            .map_err(|err| Error::new(ErrorKind::Other, err))?;
+        connection.query_drop(&last_query)?;
 
         let mut results: Vec<(Page, Vec<String>)> = Vec::new();
         let mut bugged_pages: Vec<Page> = Vec::new();
@@ -204,8 +189,8 @@ async fn wikicrawl(
                 print!(
                     "explored {}/{} pages ({}%)      \r",
                     count,
-                    max_exploring_pages,
-                    100 * count / max_exploring_pages
+                    unexplored_length,
+                    100 * count / unexplored_length
                 );
                 std::io::stdout().flush().unwrap();
                 match explore_result {
@@ -222,7 +207,7 @@ async fn wikicrawl(
             children.push(child);
         });
 
-        print!("explored 0/0 pages (0%)      \r");
+        print!("explored 0/{} pages (0%)      \r", unexplored_length);
         std::io::stdout().flush()?;
         for child in children.into_iter() {
             let (page, links) = child.await?;
@@ -251,9 +236,7 @@ async fn wikicrawl(
                     .join(","),
             ));
             println_and_log("marking bugged pages");
-            connection
-                .query_drop(&last_query)
-                .map_err(|err| Error::new(ErrorKind::Other, err))?;
+            connection.query_drop(&last_query)?;
             println_and_log(&format!("marked {} bugged pages", bugged_pages.len()));
             total_bugged += bugged_pages.len();
         }
@@ -279,8 +262,7 @@ async fn wikicrawl(
                 .query_map(
                     &last_query,
                     |(alias, id, title): (String, usize, String)| (alias, Page { id, title }),
-                )
-                .map_err(|err| Error::new(ErrorKind::Other, err))?
+                )?
                 .into_iter()
                 .collect::<HashMap<String, Page>>();
 
@@ -357,9 +339,7 @@ async fn wikicrawl(
                     .collect::<Vec<String>>()
                     .join(","),
             ));
-            let found_again_pages_ids = connection
-                .query_map(&last_query, |id: usize| id)
-                .map_err(|err| Error::new(ErrorKind::Other, err))?;
+            let found_again_pages_ids = connection.query_map(&last_query, |id: usize| id)?;
 
             let (found_again_pages, new_pages): (HashMap<String, Page>, HashMap<String, Page>) =
                 found_pages
@@ -393,9 +373,7 @@ async fn wikicrawl(
                         .join(","),
                 ));
                 println_and_log("inserting new pages");
-                connection
-                    .query_drop(&last_query)
-                    .map_err(|err| Error::new(ErrorKind::Other, err))?;
+                connection.query_drop(&last_query)?;
                 println_and_log(&format!("inserted {} new pages", added_pages));
             }
 
@@ -413,9 +391,7 @@ async fn wikicrawl(
                         .join(","),
                 ));
                 println_and_log("inserting aliases of found pages");
-                connection
-                    .query_drop(&last_query)
-                    .map_err(|err| Error::new(ErrorKind::Other, err))?;
+                connection.query_drop(&last_query)?;
                 println_and_log(&format!("inserted {} aliases", new_pages.len()));
             }
 
@@ -447,9 +423,7 @@ async fn wikicrawl(
                     .join(", "),
             ));
             println_and_log("inserting the relations ");
-            connection
-                .query_drop(&last_query)
-                .map_err(|err| Error::new(ErrorKind::Other, err))?;
+            connection.query_drop(&last_query)?;
             println_and_log(&format!("inserted {} relations", relations_found.len()));
             total_links += relations_found.len();
         }
@@ -465,9 +439,7 @@ async fn wikicrawl(
                 .join(", "),
         ));
         println_and_log("marking pages as explored ");
-        connection
-            .query_drop(&last_query)
-            .map_err(|err| Error::new(ErrorKind::Other, err))?;
+        connection.query_drop(&last_query)?;
         println_and_log(&format!("explored {} pages", unexplored_length));
         total_explored += unexplored_length;
 
@@ -480,7 +452,7 @@ async fn wikicrawl(
     return Ok(());
 }
 
-async fn explore(page: &Page) -> Result<Vec<String>, Error> {
+async fn explore(page: &Page) -> Result<Vec<String>, Box<dyn Error>> {
     let request = format!("https://fr.m.wikipedia.org/?curid={}", page.id);
 
     let mut retry_cooldown = RETRY_COOLDOWN.clone();
@@ -498,7 +470,7 @@ async fn explore(page: &Page) -> Result<Vec<String>, Error> {
 
         if body.contains("<title>Wikimedia Error</title>") {
             warn_and_log(&format!("exploring {} throwed wikimedia error", page));
-            thread::sleep(retry_cooldown);
+            time::sleep(retry_cooldown).await;
             continue;
         }
 
@@ -532,7 +504,7 @@ async fn explore(page: &Page) -> Result<Vec<String>, Error> {
     }
 }
 
-fn setup_logs() -> Result<(), Error> {
+fn setup_logs() -> Result<(), Box<dyn Error>> {
     std::fs::DirBuilder::new().recursive(true).create("logs")?;
     let mut log_name = Local::now().format("%Y-%m-%d").to_string();
     let existing_logs = std::fs::read_dir("logs")?;
@@ -583,4 +555,15 @@ fn format_link_for_mysql(link: &String) -> String {
             _ => char.to_string(),
         })
         .collect()
+}
+
+fn sigint_detect(cancel: &Arc<Mutex<bool>>) -> () {
+    let mut cancel = cancel.lock().unwrap();
+    if !*cancel {
+        println_and_log("SIGINT received, waiting for the program to stop");
+        *cancel = true;
+    } else {
+        println_and_log("SIGINT received, forcing the program to stop");
+        std::process::exit(0);
+    }
 }
