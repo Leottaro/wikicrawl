@@ -55,9 +55,27 @@ pub async fn setup_wikicrawl(
     setup_logs().unwrap();
     println_and_log("Starting wikicrawl");
 
+    println_and_log("creating SIGINT thread");
+    let sigint_cancel = Arc::new(Mutex::new(false));
+    let sigint_cancel_clone = Arc::clone(&sigint_cancel);
+    ctrlc::set_handler(move || {
+        let mut cancel = sigint_cancel_clone.lock().unwrap();
+        match *cancel {
+            false => {
+                println_and_log("SIGINT received, waiting for the program to stop");
+                *cancel = true;
+            }
+            true => {
+                println_and_log("SIGINT received, forcing the program to stop");
+                std::process::exit(0);
+            }
+        }
+    })
+    .unwrap();
+
     loop {
-        let sigint_cancel = Arc::new(Mutex::new(false));
         let mut last_query: String = String::new();
+        *sigint_cancel.lock().unwrap() = false;
         let result = wikicrawl(
             &mut last_query,
             &sigint_cancel,
@@ -117,12 +135,6 @@ async fn wikicrawl(
         "explored {} pages (with {} bugged) \nfound {} pages \nlisted {} links\n",
         total_explored, total_bugged, total_pages, total_links
     ));
-
-    {
-        println_and_log("creating SIGINT thread");
-        let sigint_cancel_clone = Arc::clone(sigint_cancel);
-        ctrlc::set_handler(move || sigint_detect(&sigint_cancel_clone))?;
-    }
 
     while {
         let temp = sigint_cancel.lock().unwrap();
@@ -555,15 +567,4 @@ fn format_link_for_mysql(link: &String) -> String {
             _ => char.to_string(),
         })
         .collect()
-}
-
-fn sigint_detect(cancel: &Arc<Mutex<bool>>) -> () {
-    let mut cancel = cancel.lock().unwrap();
-    if !*cancel {
-        println_and_log("SIGINT received, waiting for the program to stop");
-        *cancel = true;
-    } else {
-        println_and_log("SIGINT received, forcing the program to stop");
-        std::process::exit(0);
-    }
 }
