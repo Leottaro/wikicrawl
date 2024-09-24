@@ -75,9 +75,11 @@ pub async fn setup_wikicrawl(
 
     loop {
         let mut last_query: String = String::new();
+        let mut exploring_pages: Vec<Page> = Vec::new();
         *sigint_cancel.lock().unwrap() = false;
         let result = wikicrawl(
             &mut last_query,
+            &mut exploring_pages,
             &sigint_cancel,
             connection,
             max_exploring_pages,
@@ -93,6 +95,23 @@ pub async fn setup_wikicrawl(
                 error_and_log("WIKICRAWL CRASHED");
             }
             error_and_log(&format!("{}", result.unwrap_err()));
+
+            last_query = format!(
+                "UPDATE Pages SET bugged = TRUE WHERE id IN ({});",
+                exploring_pages
+                    .into_iter()
+                    .map(|page| page.id.to_string())
+                    .collect::<Vec<String>>()
+                    .join(",")
+            );
+            error_and_log("");
+            error_and_log("Marking all unexplored pages as bugged");
+            error_and_log(&format!("executing query {}", last_query));
+            connection.query_drop(last_query).unwrap_or_else(|e| {
+                error_and_log("couldn't mark all unexplored pages as bugged");
+                error_and_log(&format!("{}", e));
+            });
+
             println_and_log("program restarting in 10 seconds ...");
             println_and_log("Press CTRL + C to stop.");
             time::sleep(Duration::from_secs(10)).await;
@@ -105,6 +124,7 @@ pub async fn setup_wikicrawl(
 
 async fn wikicrawl(
     last_query: &mut String,
+    exploring_pages: &mut Vec<Page>,
     sigint_cancel: &Arc<Mutex<bool>>,
     connection: &mut PooledConn,
     max_exploring_pages: usize,
@@ -147,15 +167,19 @@ async fn wikicrawl(
             max_exploring_pages
         ));
         println_and_log("getting unexplored pages");
-        let unexplored_pages =
-            connection.query_map(&last_query, |(id, title)| Page { id, title })?;
-        let unexplored_length = unexplored_pages.len();
+        exploring_pages.clear();
+        exploring_pages.extend(
+            connection
+                .query_map(&last_query, |(id, title)| Page { id, title })?
+                .into_iter(),
+        );
+        let unexplored_length = exploring_pages.len();
         if unexplored_length < 1 {
             return Err(Box::from("No unexplored pages found"));
         }
         println_and_log(&format!(
             "Exploring pages: [{}]",
-            unexplored_pages
+            exploring_pages
                 .iter()
                 .map(|page| page.to_string())
                 .collect::<Vec<String>>()
@@ -167,7 +191,7 @@ async fn wikicrawl(
         last_query.clear();
         last_query.push_str(&format!(
             "DELETE FROM Links WHERE linker IN ({});",
-            unexplored_pages
+            exploring_pages
                 .iter()
                 .map(|page| page.id.to_string())
                 .collect::<Vec<String>>()
@@ -188,8 +212,7 @@ async fn wikicrawl(
             .enable_all()
             .thread_name("wikicrawl exploring".to_string())
             .build()?;
-
-        unexplored_pages.into_iter().for_each(|page| {
+        exploring_pages.clone().into_iter().for_each(|page| {
             let thread_explored_count = Arc::clone(&shared_explored_count);
             let child = exploring_runtime.spawn(async move {
                 let explore_result = explore(&page).await;

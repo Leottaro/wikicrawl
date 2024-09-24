@@ -36,6 +36,15 @@ impl Display for Page {
     }
 }
 
+impl Clone for Page {
+    fn clone(&self) -> Self {
+        Page {
+            id: self.id,
+            title: self.title.clone(),
+        }
+    }
+}
+
 // NEW PAGES
 
 pub const RETRY_COOLDOWN: Duration = Duration::from_secs(3);
