@@ -4,6 +4,7 @@ use chrono::Local;
 use env_logger::Builder as EnvBuilder;
 use log::LevelFilter;
 use mysql::{prelude::*, PooledConn};
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::File;
@@ -45,6 +46,7 @@ const WIKIPEDIA_NAMESPACES: [&str; 28] = [
     "discussion_module:",
     "sujet:",
 ];
+const MAX_SAME_ERROR: usize = 3;
 
 pub async fn setup_wikicrawl(
     connection: &mut PooledConn,
@@ -73,6 +75,8 @@ pub async fn setup_wikicrawl(
     })
     .unwrap();
 
+    let error_regex = Regex::new(r"(?m)ERROR ([0-9]+) ").unwrap();
+    let mut error_count: HashMap<usize, usize> = HashMap::new();
     loop {
         let mut last_query: String = String::new();
         let mut exploring_pages: Vec<Page> = Vec::new();
@@ -87,38 +91,61 @@ pub async fn setup_wikicrawl(
         )
         .await;
         *sigint_cancel.lock().unwrap() = true;
-        if result.is_err() {
-            if !last_query.is_empty() {
-                error_and_log("WIKICRAWL CRASHED WITH LAST QUERY BEING");
-                error_and_log(&format!("{}", last_query));
-            } else {
-                error_and_log("WIKICRAWL CRASHED");
-            }
-            error_and_log(&format!("{}", result.unwrap_err()));
-
-            last_query = format!(
-                "UPDATE Pages SET bugged = TRUE WHERE id IN ({});",
-                exploring_pages
-                    .into_iter()
-                    .map(|page| page.id.to_string())
-                    .collect::<Vec<String>>()
-                    .join(",")
-            );
-            error_and_log("");
-            error_and_log("Marking all unexplored pages as bugged");
-            error_and_log(&format!("executing query {}", last_query));
-            connection.query_drop(last_query).unwrap_or_else(|e| {
-                error_and_log("couldn't mark all unexplored pages as bugged");
-                error_and_log(&format!("{}", e));
-            });
-
-            println_and_log("program restarting in 10 seconds ...");
-            println_and_log("Press CTRL + C to stop.");
-            time::sleep(Duration::from_secs(10)).await;
-        } else {
-            println_and_log("WIKICRAWL FINISHED");
-            return ();
+        if result.is_ok() {
+            continue;
         }
+
+        if !last_query.is_empty() {
+            error_and_log("WIKICRAWL CRASHED WITH LAST QUERY BEING");
+            error_and_log(&format!("{}", last_query));
+        } else {
+            error_and_log("WIKICRAWL CRASHED");
+        }
+        let error = result.unwrap_err().to_string();
+        error_and_log(&format!("{}", error));
+
+        last_query = format!(
+            "UPDATE Pages SET bugged = TRUE WHERE id IN ({});",
+            exploring_pages
+                .into_iter()
+                .map(|page| page.id.to_string())
+                .collect::<Vec<String>>()
+                .join(",")
+        );
+        error_and_log("");
+        error_and_log("Marking all unexplored pages as bugged");
+        error_and_log(&format!("executing query {}", last_query));
+        connection.query_drop(last_query).unwrap_or_else(|e| {
+            error_and_log("couldn't mark all unexplored pages as bugged");
+            error_and_log(&format!("{}", e));
+        });
+
+        let error_captures = error_regex.captures(&error);
+        match error_captures {
+            Some(capture) => {
+                let error_code = capture.get(1).unwrap().as_str().parse::<usize>().unwrap();
+                let count = error_count
+                    .entry(error_code)
+                    .and_modify(|counter| *counter += 1)
+                    .or_insert(1);
+                if *count > MAX_SAME_ERROR {
+                    error_and_log("Too many same errors, stopping the program");
+                    break;
+                } else {
+                    println_and_log("program restarting in 10 seconds ...");
+                    println_and_log("Press CTRL + C to stop.");
+                    time::sleep(Duration::from_secs(10)).await;
+                    continue;
+                }
+            }
+            None => {
+                error_and_log("Couldn't find error code in error message");
+                error_and_log("Stopping the program");
+            }
+        }
+
+        println_and_log("WIKICRAWL FINISHED");
+        return ();
     }
 }
 
