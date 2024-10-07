@@ -158,6 +158,16 @@ async fn extract_link_info_web(url: &str) -> Page {
     }
 }
 
+pub fn format_link_for_mysql(link: &String) -> String {
+    link.chars()
+        .map(|char| match char {
+            '\\' => "\\\\".to_string(),
+            '"' => "\"\"".to_string(),
+            _ => char.to_string(),
+        })
+        .collect()
+}
+
 fn format_url_for_api_reqwest(url: &str) -> String {
     url.chars()
         .map(|char| match char {

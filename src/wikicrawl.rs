@@ -581,13 +581,3 @@ fn setup_logs() -> Result<(), Box<dyn Error>> {
         .init();
     Ok(())
 }
-
-fn format_link_for_mysql(link: &String) -> String {
-    link.chars()
-        .map(|char| match char {
-            '\\' => "\\\\".to_string(),
-            '"' => "\"\"".to_string(),
-            _ => char.to_string(),
-        })
-        .collect()
-}
