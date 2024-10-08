@@ -7,15 +7,16 @@ CREATE TABLE IF NOT EXISTS Pages (
   title VARCHAR(255) COLLATE utf8mb4_bin UNIQUE NOT NULL,
   explored BOOLEAN DEFAULT false,
   bugged BOOLEAN DEFAULT false,
-  PRIMARY KEY (id)
+  PRIMARY KEY (id),
+  FULLTEXT(title)
 );
-CREATE INDEX page_index ON Pages(id);
 
 CREATE TABLE IF NOT EXISTS Alias (
   alias VARCHAR(255) COLLATE utf8mb4_bin UNIQUE NOT NULL,
   id INT UNSIGNED NOT NULL,
   PRIMARY KEY (alias, id),
-  FOREIGN KEY (id) REFERENCES Pages(id)
+  FOREIGN KEY (id) REFERENCES Pages(id),
+  FULLTEXT(alias)
 );
 
 CREATE TABLE IF NOT EXISTS Links (

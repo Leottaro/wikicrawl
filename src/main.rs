@@ -1,6 +1,9 @@
 pub mod wikicrawl;
 use wikicrawl::setup_wikicrawl;
 
+pub mod wikipath;
+use wikipath::setup_wikipath;
+
 use mysql::Pool;
 use std::{
     collections::HashMap,
@@ -43,7 +46,7 @@ async fn main() {
             command_line_argument = 0;
         }
         match user_input.trim().parse::<usize>() {
-            Ok(1) => println!("Wikipath is not implemented yet"),
+            Ok(1) => setup_wikipath(&mut connection).await,
             Ok(2) => setup_wikicrawl(&mut connection, max_exploring_pages, max_new_pages).await,
             Ok(3) => println!("Exiting the program"),
             _ => {
