@@ -178,10 +178,14 @@ async fn wikicrawl(
         .unwrap_or(Some(0))
         .unwrap_or(0);
 
+    println_and_log("");
     println_and_log(&format!(
-        "explored {} pages (with {} bugged) \nfound {} pages \nlisted {} links\n",
-        total_explored, total_bugged, total_pages, total_links
+        "explored {} pages (with {} bugged)",
+        total_explored, total_bugged
     ));
+    println_and_log(&format!("found {} pages", total_pages));
+    println_and_log(&format!("listed {} links", total_links));
+    println_and_log("");
 
     while {
         let temp = sigint_cancel.lock().unwrap();
@@ -202,6 +206,7 @@ async fn wikicrawl(
         );
         let unexplored_length = exploring_pages.len();
         if unexplored_length < 1 {
+            error_and_log("No unexplored pages found");
             return Err(Box::from("No unexplored pages found"));
         }
         println_and_log(&format!(
@@ -505,10 +510,14 @@ async fn wikicrawl(
         println_and_log(&format!("explored {} pages", unexplored_length));
         total_explored += unexplored_length;
 
+        println_and_log("");
         println_and_log(&format!(
-            "explored {} pages (with {} bugged) \nfound {} pages \nlisted {} links\n",
-            total_explored, total_bugged, total_pages, total_links
+            "explored {} pages (with {} bugged)",
+            total_explored, total_bugged
         ));
+        println_and_log(&format!("found {} pages", total_pages));
+        println_and_log(&format!("listed {} links", total_links));
+        println_and_log("");
     }
 
     return Ok(());
