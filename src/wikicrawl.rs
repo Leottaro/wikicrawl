@@ -1,13 +1,15 @@
 use lib::*;
 
 use chrono::Local;
-use env_logger::Builder as EnvBuilder;
 use log::LevelFilter;
+use log4rs::append::file::FileAppender;
+use log4rs::config::{Appender, Root};
+use log4rs::encode::pattern::PatternEncoder;
+use log4rs::Config;
 use mysql::{prelude::*, PooledConn};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::fs::File;
 use std::io::Write;
 use std::ops::{AddAssign, SubAssign};
 use std::sync::{Arc, Mutex};
@@ -48,6 +50,13 @@ const WIKIPEDIA_NAMESPACES: [&str; 28] = [
 ];
 const MAX_SAME_ERROR: usize = 3;
 
+struct TotalInfo {
+    explored: usize,
+    bugged: usize,
+    pages: usize,
+    links: usize,
+}
+
 pub async fn setup_wikicrawl(
     connection: &mut PooledConn,
     max_exploring_pages: usize,
@@ -75,6 +84,33 @@ pub async fn setup_wikicrawl(
     })
     .unwrap();
 
+    let mut total_info = TotalInfo {
+        explored: 0,
+        bugged: 0,
+        pages: 0,
+        links: 0,
+    };
+    println_and_log("querying total explored pages");
+    total_info.explored = connection
+        .query_first("SELECT COUNT(*) FROM Pages WHERE explored = TRUE;")
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
+    println_and_log("querying total bugged pages");
+    total_info.bugged = connection
+        .query_first("SELECT COUNT(*) FROM Pages WHERE bugged = TRUE;")
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
+    println_and_log("querying total pages");
+    total_info.pages = connection
+        .query_first("SELECT COUNT(*) FROM Pages;")
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
+    println_and_log("querying total links");
+    total_info.links = connection
+        .query_first("SELECT COUNT(*) FROM Links;")
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
+
     let error_regex = Regex::new(r"(?m)ERROR ([0-9]+) ").unwrap();
     let mut error_count: HashMap<usize, usize> = HashMap::new();
     loop {
@@ -84,8 +120,9 @@ pub async fn setup_wikicrawl(
         let result = wikicrawl(
             &mut last_query,
             &mut exploring_pages,
-            &sigint_cancel,
+            &mut total_info,
             connection,
+            &sigint_cancel,
             max_exploring_pages,
             max_new_pages,
         )
@@ -152,39 +189,19 @@ pub async fn setup_wikicrawl(
 async fn wikicrawl(
     last_query: &mut String,
     exploring_pages: &mut Vec<Page>,
-    sigint_cancel: &Arc<Mutex<bool>>,
+    total_info: &mut TotalInfo,
     connection: &mut PooledConn,
+    sigint_cancel: &Arc<Mutex<bool>>,
     max_exploring_pages: usize,
     max_new_pages: usize,
 ) -> Result<(), Box<dyn Error>> {
-    println_and_log("querying total explored pages");
-    let mut total_explored: usize = connection
-        .query_first("SELECT COUNT(*) FROM Pages WHERE explored = TRUE;")
-        .unwrap_or(Some(0))
-        .unwrap_or(0);
-    println_and_log("querying total bugged pages");
-    let mut total_bugged: usize = connection
-        .query_first("SELECT COUNT(*) FROM Pages WHERE bugged = TRUE;")
-        .unwrap_or(Some(0))
-        .unwrap_or(0);
-    println_and_log("querying total pages");
-    let mut total_pages: usize = connection
-        .query_first("SELECT COUNT(*) FROM Pages;")
-        .unwrap_or(Some(0))
-        .unwrap_or(0);
-    println_and_log("querying total links");
-    let mut total_links: usize = connection
-        .query_first("SELECT COUNT(*) FROM Links;")
-        .unwrap_or(Some(0))
-        .unwrap_or(0);
-
     println_and_log("");
     println_and_log(&format!(
         "explored {} pages (with {} bugged)",
-        total_explored, total_bugged
+        total_info.explored, total_info.bugged
     ));
-    println_and_log(&format!("found {} pages", total_pages));
-    println_and_log(&format!("listed {} links", total_links));
+    println_and_log(&format!("found {} pages", total_info.pages));
+    println_and_log(&format!("listed {} links", total_info.links));
     println_and_log("");
 
     while {
@@ -305,7 +322,7 @@ async fn wikicrawl(
             println_and_log("marking bugged pages");
             connection.query_drop(&last_query)?;
             println_and_log(&format!("marked {} bugged pages", bugged_pages.len()));
-            total_bugged += bugged_pages.len();
+            total_info.bugged += bugged_pages.len();
         }
 
         let found_links = results
@@ -427,7 +444,7 @@ async fn wikicrawl(
 
             // insert new pages
             if added_pages > 0 {
-                total_pages += added_pages;
+                total_info.pages += added_pages;
                 last_query.clear();
                 last_query.push_str(&format!(
                     "INSERT INTO Pages (id, title) VALUES {};",
@@ -492,7 +509,7 @@ async fn wikicrawl(
             println_and_log("inserting the relations ");
             connection.query_drop(&last_query)?;
             println_and_log(&format!("inserted {} relations", relations_found.len()));
-            total_links += relations_found.len();
+            total_info.links += relations_found.len();
         }
 
         // mark as explored
@@ -508,15 +525,15 @@ async fn wikicrawl(
         println_and_log("marking pages as explored ");
         connection.query_drop(&last_query)?;
         println_and_log(&format!("explored {} pages", unexplored_length));
-        total_explored += unexplored_length;
+        total_info.explored += unexplored_length;
 
         println_and_log("");
         println_and_log(&format!(
             "explored {} pages (with {} bugged)",
-            total_explored, total_bugged
+            total_info.explored, total_info.bugged
         ));
-        println_and_log(&format!("found {} pages", total_pages));
-        println_and_log(&format!("listed {} links", total_links));
+        println_and_log(&format!("found {} pages", total_info.pages));
+        println_and_log(&format!("listed {} links", total_info.links));
         println_and_log("");
     }
 
@@ -577,43 +594,48 @@ async fn explore(page: &Page) -> Result<Vec<String>, Box<dyn Error>> {
 
 fn setup_logs() -> Result<(), Box<dyn Error>> {
     std::fs::DirBuilder::new().recursive(true).create("logs")?;
-    let mut log_name = Local::now().format("%Y-%m-%d").to_string();
-    let existing_logs = std::fs::read_dir("logs")?;
-    let this_day_logs = existing_logs
-        .into_iter()
-        .filter_map(|file| match file {
-            Ok(entry) => match entry.file_name().into_string() {
-                Ok(name) => {
-                    if name.starts_with(&log_name) {
-                        Some(name)
-                    } else {
-                        None
-                    }
-                }
-                Err(_) => None,
-            },
-            Err(_) => None,
-        })
-        .count();
-    if this_day_logs > 0 {
-        log_name.push_str(&format!("_{}", this_day_logs + 1));
-    }
+    let log_name = Local::now().format("%Y-%m-%d").to_string();
+    let log_pattern = "{d(%Y-%m-%d_%H:%M:%S)}-[{l}]: {m}{n}";
 
-    let target =
-        Box::new(File::create(format!("logs/{}.log", log_name)).expect("Can't create file"));
+    let day_file = FileAppender::builder()
+        .encoder(Box::new(PatternEncoder::new(log_pattern)))
+        .build(format!("logs/{}.log", log_name))
+        .unwrap();
 
-    EnvBuilder::new()
-        .format(|buf, record| {
-            writeln!(
-                buf,
-                "{}-[{}]: {}",
-                Local::now().format("%Y-%m-%d_%H:%M:%S%.3f"),
-                record.level(),
-                record.args()
-            )
-        })
-        .target(env_logger::Target::Pipe(target))
-        .filter(None, LevelFilter::Info)
-        .init();
+    std::fs::write("logs/latest.log", "").unwrap_or_default();
+    let latest_file = FileAppender::builder()
+        .encoder(Box::new(PatternEncoder::new(log_pattern)))
+        .build("logs/latest.log")
+        .unwrap();
+
+    let config = Config::builder()
+        .appender(Appender::builder().build("day_file", Box::new(day_file)))
+        .appender(Appender::builder().build("latest_file", Box::new(latest_file)))
+        .build(
+            Root::builder()
+                .appender("day_file")
+                .appender("latest_file")
+                .build(LevelFilter::Info),
+        )
+        .unwrap();
+
+    log4rs::init_config(config).unwrap();
+
+    // let day_target =
+    //     Box::new(File::create(format!("logs/{}.log", log_name)).expect("Can't create file"));
+    // EnvBuilder::new()
+    //     .format(|buf, record| {
+    //         writeln!(
+    //             buf,
+    //             "{}-[{}]: {}",
+    //             Local::now().format("%Y-%m-%d_%H:%M:%S%.3f"),
+    //             record.level(),
+    //             record.args()
+    //         )
+    //     })
+    //     .target(env_logger::Target::Pipe(day_target))
+    //     .filter(None, LevelFilter::Off)
+    //     .init();
+
     Ok(())
 }
