@@ -1,7 +1,8 @@
 use lib::*;
 
 use chrono::Local;
-use log::LevelFilter;
+use log::{error, info, warn, LevelFilter};
+use log4rs::append::console::{ConsoleAppender, Target};
 use log4rs::append::file::FileAppender;
 use log4rs::config::{Appender, Root};
 use log4rs::encode::pattern::PatternEncoder;
@@ -64,20 +65,20 @@ pub async fn setup_wikicrawl(
 ) -> () {
     println!("setting up logs");
     setup_logs().unwrap();
-    println_and_log("Starting wikicrawl");
+    info!("Starting wikicrawl");
 
-    println_and_log("creating SIGINT thread");
+    info!("creating SIGINT thread");
     let sigint_cancel = Arc::new(Mutex::new(false));
     let sigint_cancel_clone = Arc::clone(&sigint_cancel);
     ctrlc::set_handler(move || {
         let mut cancel = sigint_cancel_clone.lock().unwrap();
         match *cancel {
             false => {
-                println_and_log("SIGINT received, waiting for the program to stop");
+                info!("SIGINT received, waiting for the program to stop");
                 *cancel = true;
             }
             true => {
-                println_and_log("SIGINT received, forcing the program to stop");
+                info!("SIGINT received, forcing the program to stop");
                 std::process::exit(0);
             }
         }
@@ -90,22 +91,22 @@ pub async fn setup_wikicrawl(
         pages: 0,
         links: 0,
     };
-    println_and_log("querying total explored pages");
+    info!("querying total explored pages");
     total_info.explored = connection
         .query_first("SELECT COUNT(*) FROM Pages WHERE explored = TRUE;")
         .unwrap_or(Some(0))
         .unwrap_or(0);
-    println_and_log("querying total bugged pages");
+    info!("querying total bugged pages");
     total_info.bugged = connection
         .query_first("SELECT COUNT(*) FROM Pages WHERE bugged = TRUE;")
         .unwrap_or(Some(0))
         .unwrap_or(0);
-    println_and_log("querying total pages");
+    info!("querying total pages");
     total_info.pages = connection
         .query_first("SELECT COUNT(*) FROM Pages;")
         .unwrap_or(Some(0))
         .unwrap_or(0);
-    println_and_log("querying total links");
+    info!("querying total links");
     total_info.links = connection
         .query_first("SELECT COUNT(*) FROM Links;")
         .unwrap_or(Some(0))
@@ -133,13 +134,13 @@ pub async fn setup_wikicrawl(
         }
 
         if !last_query.is_empty() {
-            error_and_log("WIKICRAWL CRASHED WITH LAST QUERY BEING");
-            error_and_log(&format!("{}", last_query));
+            error!("WIKICRAWL CRASHED WITH LAST QUERY BEING");
+            error!("{}", last_query);
         } else {
-            error_and_log("WIKICRAWL CRASHED");
+            error!("WIKICRAWL CRASHED");
         }
         let error = result.unwrap_err().to_string();
-        error_and_log(&format!("{}", error));
+        error!("{}", error);
 
         last_query = format!(
             "UPDATE Pages SET bugged = TRUE WHERE id IN ({});",
@@ -149,12 +150,12 @@ pub async fn setup_wikicrawl(
                 .collect::<Vec<String>>()
                 .join(",")
         );
-        error_and_log("");
-        error_and_log("Marking all unexplored pages as bugged");
-        error_and_log(&format!("executing query {}", last_query));
+        error!("");
+        error!("Marking all unexplored pages as bugged");
+        error!("executing query {}", last_query);
         connection.query_drop(last_query).unwrap_or_else(|e| {
-            error_and_log("couldn't mark all unexplored pages as bugged");
-            error_and_log(&format!("{}", e));
+            error!("couldn't mark all unexplored pages as bugged");
+            error!("{}", e);
         });
 
         let error_captures = error_regex.captures(&error);
@@ -166,22 +167,22 @@ pub async fn setup_wikicrawl(
                     .and_modify(|counter| *counter += 1)
                     .or_insert(1);
                 if *count > MAX_SAME_ERROR {
-                    error_and_log("Too many same errors, stopping the program");
+                    error!("Too many same errors, stopping the program");
                     break;
                 } else {
-                    println_and_log("program restarting in 10 seconds ...");
-                    println_and_log("Press CTRL + C to stop.");
+                    info!("program restarting in 10 seconds ...");
+                    info!("Press CTRL + C to stop.");
                     time::sleep(Duration::from_secs(10)).await;
                     continue;
                 }
             }
             None => {
-                error_and_log("Couldn't find error code in error message");
-                error_and_log("Stopping the program");
+                error!("Couldn't find error code in error message");
+                error!("Stopping the program");
             }
         }
 
-        println_and_log("WIKICRAWL FINISHED");
+        info!("WIKICRAWL FINISHED");
         return ();
     }
 }
@@ -195,14 +196,14 @@ async fn wikicrawl(
     max_exploring_pages: usize,
     max_new_pages: usize,
 ) -> Result<(), Box<dyn Error>> {
-    println_and_log("");
-    println_and_log(&format!(
+    info!("");
+    info!(
         "explored {} pages (with {} bugged)",
         total_info.explored, total_info.bugged
-    ));
-    println_and_log(&format!("found {} pages", total_info.pages));
-    println_and_log(&format!("listed {} links", total_info.links));
-    println_and_log("");
+    );
+    info!("found {} pages", total_info.pages);
+    info!("listed {} links", total_info.links);
+    info!("");
 
     while {
         let temp = sigint_cancel.lock().unwrap();
@@ -214,7 +215,7 @@ async fn wikicrawl(
             "SELECT id, title FROM Pages WHERE explored = false AND bugged = false ORDER BY id ASC LIMIT {};",
             max_exploring_pages
         ));
-        println_and_log("getting unexplored pages");
+        info!("getting unexplored pages");
         exploring_pages.clear();
         exploring_pages.extend(
             connection
@@ -223,20 +224,20 @@ async fn wikicrawl(
         );
         let unexplored_length = exploring_pages.len();
         if unexplored_length < 1 {
-            error_and_log("No unexplored pages found");
+            error!("No unexplored pages found");
             return Err(Box::from("No unexplored pages found"));
         }
-        println_and_log(&format!(
+        info!(
             "Exploring pages: [{}]",
             exploring_pages
                 .iter()
                 .map(|page| page.to_string())
                 .collect::<Vec<String>>()
                 .join(", ")
-        ));
+        );
 
         // delete potential links from an old run
-        println_and_log("deleting potential links from an old run");
+        info!("deleting potential links from an old run");
         last_query.clear();
         last_query.push_str(&format!(
             "DELETE FROM Links WHERE linker IN ({});",
@@ -254,7 +255,7 @@ async fn wikicrawl(
         let now = Instant::now();
         let shared_explored_count = Arc::new(Mutex::new(0 as usize));
 
-        println_and_log(&format!("exploring pages"));
+        info!("exploring pages");
 
         let exploring_runtime = RuntimeBuilder::new_multi_thread()
             .worker_threads(unexplored_length)
@@ -302,11 +303,11 @@ async fn wikicrawl(
         }
         exploring_runtime.shutdown_background();
 
-        println_and_log(&format!(
+        info!(
             "explored {} pages in {} ms",
             unexplored_length,
             now.elapsed().as_millis()
-        ));
+        );
 
         // mark as bugged if there are
         if !bugged_pages.is_empty() {
@@ -319,9 +320,9 @@ async fn wikicrawl(
                     .collect::<Vec<String>>()
                     .join(","),
             ));
-            println_and_log("marking bugged pages");
+            info!("marking bugged pages");
             connection.query_drop(&last_query)?;
-            println_and_log(&format!("marked {} bugged pages", bugged_pages.len()));
+            info!("marked {} bugged pages", bugged_pages.len());
             total_info.bugged += bugged_pages.len();
         }
 
@@ -330,7 +331,7 @@ async fn wikicrawl(
             .map(|(_, links)| links.clone())
             .flatten()
             .collect::<HashSet<String>>();
-        println_and_log(&format!("found {} links", found_links.len()));
+        info!("found {} links", found_links.len());
 
         if found_links.len() > 0 {
             let now = Instant::now();
@@ -350,11 +351,11 @@ async fn wikicrawl(
                 .into_iter()
                 .collect::<HashMap<String, Page>>();
 
-            println_and_log(&format!(
+            info!(
                 "found {} old pages ({}ms)",
                 old_pages.len(),
                 now.elapsed().as_millis()
-            ));
+            );
 
             let new_links = found_links
                 .into_iter()
@@ -407,11 +408,11 @@ async fn wikicrawl(
 
             new_pages_runtime.shutdown_background();
 
-            println_and_log(&format!(
+            info!(
                 "found {} pages ({}ms)               ",
                 found_pages.len(),
                 shared_now.lock().unwrap().elapsed().as_millis()
-            ));
+            );
 
             // split found_pages into new_pages and found_again_pages using the connection
             last_query.clear();
@@ -439,8 +440,8 @@ async fn wikicrawl(
                 .collect::<HashSet<&Page>>();
             let added_pages = unique_new_pages.len();
 
-            println_and_log(&format!("found {} new pages", unique_new_pages.len(),));
-            println_and_log(&format!("found again {} old pages", old_pages.len()));
+            info!("found {} new pages", unique_new_pages.len(),);
+            info!("found again {} old pages", old_pages.len());
 
             // insert new pages
             if added_pages > 0 {
@@ -456,9 +457,9 @@ async fn wikicrawl(
                         .collect::<Vec<String>>()
                         .join(","),
                 ));
-                println_and_log("inserting new pages");
+                info!("inserting new pages");
                 connection.query_drop(&last_query)?;
-                println_and_log(&format!("inserted {} new pages", added_pages));
+                info!("inserted {} new pages", added_pages);
             }
 
             // insert aliases of new Pages
@@ -474,13 +475,13 @@ async fn wikicrawl(
                         .collect::<Vec<String>>()
                         .join(","),
                 ));
-                println_and_log("inserting aliases of found pages");
+                info!("inserting aliases of found pages");
                 connection.query_drop(&last_query)?;
-                println_and_log(&format!("inserted {} aliases", new_pages.len()));
+                info!("inserted {} aliases", new_pages.len());
             }
 
             // transform the results array into an array of relations between pages
-            println_and_log("generating relations ");
+            info!("generating relations ");
             let relations_found = results
                 .iter()
                 .map(|(page, links)| {
@@ -494,7 +495,7 @@ async fn wikicrawl(
                 })
                 .flatten()
                 .collect::<HashSet<(&Page, &Page)>>();
-            println_and_log(&format!("generated {} relations", relations_found.len()));
+            info!("generated {} relations", relations_found.len());
 
             // insert the new relations
             last_query.clear();
@@ -506,9 +507,9 @@ async fn wikicrawl(
                     .collect::<Vec<String>>()
                     .join(", "),
             ));
-            println_and_log("inserting the relations ");
+            info!("inserting the relations ");
             connection.query_drop(&last_query)?;
-            println_and_log(&format!("inserted {} relations", relations_found.len()));
+            info!("inserted {} relations", relations_found.len());
             total_info.links += relations_found.len();
         }
 
@@ -522,19 +523,19 @@ async fn wikicrawl(
                 .collect::<Vec<String>>()
                 .join(", "),
         ));
-        println_and_log("marking pages as explored ");
+        info!("marking pages as explored ");
         connection.query_drop(&last_query)?;
-        println_and_log(&format!("explored {} pages", unexplored_length));
+        info!("explored {} pages", unexplored_length);
         total_info.explored += unexplored_length;
 
-        println_and_log("");
-        println_and_log(&format!(
+        info!("");
+        info!(
             "explored {} pages (with {} bugged)",
             total_info.explored, total_info.bugged
-        ));
-        println_and_log(&format!("found {} pages", total_info.pages));
-        println_and_log(&format!("listed {} links", total_info.links));
-        println_and_log("");
+        );
+        info!("found {} pages", total_info.pages);
+        info!("listed {} links", total_info.links);
+        info!("");
     }
 
     return Ok(());
@@ -557,7 +558,7 @@ async fn explore(page: &Page) -> Result<Vec<String>, Box<dyn Error>> {
             .unwrap();
 
         if body.contains("<title>Wikimedia Error</title>") {
-            warn_and_log(&format!("exploring {} throwed wikimedia error", page));
+            warn!("exploring {} throwed wikimedia error", page);
             time::sleep(retry_cooldown).await;
             continue;
         }
@@ -582,10 +583,10 @@ async fn explore(page: &Page) -> Result<Vec<String>, Box<dyn Error>> {
             .collect::<Vec<String>>();
 
         if filtered_links.is_empty() {
-            warn_and_log(&format!(
+            warn!(
                 "No links found in Page {{ id: {}, title: \"{}\" }}",
                 page.id, page.title
-            ));
+            );
         }
 
         return Ok(filtered_links);
@@ -594,13 +595,36 @@ async fn explore(page: &Page) -> Result<Vec<String>, Box<dyn Error>> {
 
 fn setup_logs() -> Result<(), Box<dyn Error>> {
     std::fs::DirBuilder::new().recursive(true).create("logs")?;
-    let log_name = Local::now().format("%Y-%m-%d").to_string();
     let log_pattern = "{d(%Y-%m-%d_%H:%M:%S)}-[{l}]: {m}{n}";
+
+    let mut log_name = Local::now().format("%Y-%m-%d").to_string();
+    let this_day_logs = std::fs::read_dir("logs")?
+        .into_iter()
+        .filter_map(|file| match file {
+            Ok(entry) => match entry.file_name().into_string() {
+                Ok(name) => {
+                    if name.starts_with(&log_name) {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            },
+            Err(_) => None,
+        })
+        .count();
+    log_name.push_str(&format!("_{}", this_day_logs));
 
     let day_file = FileAppender::builder()
         .encoder(Box::new(PatternEncoder::new(log_pattern)))
         .build(format!("logs/{}.log", log_name))
         .unwrap();
+
+    let stdout = ConsoleAppender::builder()
+        .target(Target::Stdout)
+        .encoder(Box::new(PatternEncoder::new(log_pattern)))
+        .build();
 
     std::fs::write("logs/latest.log", "").unwrap_or_default();
     let latest_file = FileAppender::builder()
@@ -609,10 +633,12 @@ fn setup_logs() -> Result<(), Box<dyn Error>> {
         .unwrap();
 
     let config = Config::builder()
+        .appender(Appender::builder().build("stdout", Box::new(stdout)))
         .appender(Appender::builder().build("day_file", Box::new(day_file)))
         .appender(Appender::builder().build("latest_file", Box::new(latest_file)))
         .build(
             Root::builder()
+                .appender("stdout")
                 .appender("day_file")
                 .appender("latest_file")
                 .build(LevelFilter::Info),
@@ -620,22 +646,6 @@ fn setup_logs() -> Result<(), Box<dyn Error>> {
         .unwrap();
 
     log4rs::init_config(config).unwrap();
-
-    // let day_target =
-    //     Box::new(File::create(format!("logs/{}.log", log_name)).expect("Can't create file"));
-    // EnvBuilder::new()
-    //     .format(|buf, record| {
-    //         writeln!(
-    //             buf,
-    //             "{}-[{}]: {}",
-    //             Local::now().format("%Y-%m-%d_%H:%M:%S%.3f"),
-    //             record.level(),
-    //             record.args()
-    //         )
-    //     })
-    //     .target(env_logger::Target::Pipe(day_target))
-    //     .filter(None, LevelFilter::Off)
-    //     .init();
 
     Ok(())
 }

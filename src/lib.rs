@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::{AddAssign, Mul};
 use std::time::Duration;
 
-use log::{error, info, warn};
+use log::{error, warn};
 use regex::Regex;
 use reqwest::{Client, ClientBuilder};
 
@@ -91,20 +91,14 @@ pub async fn extract_link_info_api(url: &str) -> Page {
             .replace("\n", "");
 
         if !body.starts_with('{') {
-            warn_and_log(&format!(
-                "link info api of url {} throwed wikimedia error",
-                url
-            ));
+            warn!("link info api of url {} throwed wikimedia error", url);
             std::thread::sleep(retry_cooldown);
             continue;
         }
 
         if !body.starts_with("{\"batchcomplete\":true,") || body.ends_with("\"search\":[]}}") {
             // à envoyer au web
-            warn_and_log(&format!(
-                "API can't find #\"{}\"# with body\n{}",
-                request, body
-            ));
+            warn!("API can't find #\"{}\"# with body\n{}", request, body);
             return extract_link_info_web(url).await;
         }
 
@@ -117,7 +111,7 @@ pub async fn extract_link_info_api(url: &str) -> Page {
                 };
             }
             None => {
-                error_and_log(&format!("error: no match in body: {}\n\n\n", body));
+                error!("error: no match in body: {}\n\n\n", body);
                 std::process::exit(0);
             }
         }
@@ -149,10 +143,7 @@ async fn extract_link_info_web(url: &str) -> Page {
             };
         }
         None => {
-            error_and_log(&format!(
-                "no match in body for url {}: \n{}\n\n\n",
-                url, body
-            ));
+            error!("no match in body for url {}: \n{}\n\n\n", url, body);
             std::process::exit(0);
         }
     }
@@ -185,21 +176,4 @@ fn format_url_for_reqwest(url: &str) -> String {
             _ => char.to_string(),
         })
         .collect()
-}
-
-// LOGGING
-
-pub fn println_and_log(message: &str) {
-    println!("{}", message);
-    info!("{}", message);
-}
-
-pub fn warn_and_log(message: &str) {
-    eprintln!("{}", message);
-    warn!("{}", message);
-}
-
-pub fn error_and_log(message: &str) {
-    eprintln!("{}", message);
-    error!("{}", message);
 }
