@@ -129,56 +129,55 @@ pub async fn setup_wikicrawl(
         )
         .await;
         *sigint_cancel.lock().unwrap() = true;
-        if result.is_ok() {
-            continue;
-        }
 
-        if !last_query.is_empty() {
-            error!("WIKICRAWL CRASHED WITH LAST QUERY BEING");
-            error!("{}", last_query);
-        } else {
-            error!("WIKICRAWL CRASHED");
-        }
-        let error = result.unwrap_err().to_string();
-        error!("{}", error);
-
-        last_query = format!(
-            "UPDATE Pages SET bugged = TRUE WHERE id IN ({});",
-            exploring_pages
-                .into_iter()
-                .map(|page| page.id.to_string())
-                .collect::<Vec<String>>()
-                .join(",")
-        );
-        error!("");
-        error!("Marking all unexplored pages as bugged");
-        error!("executing query {}", last_query);
-        connection.query_drop(last_query).unwrap_or_else(|e| {
-            error!("couldn't mark all unexplored pages as bugged");
-            error!("{}", e);
-        });
-
-        let error_captures = error_regex.captures(&error);
-        match error_captures {
-            Some(capture) => {
-                let error_code = capture.get(1).unwrap().as_str().parse::<usize>().unwrap();
-                let count = error_count
-                    .entry(error_code)
-                    .and_modify(|counter| *counter += 1)
-                    .or_insert(1);
-                if *count > MAX_SAME_ERROR {
-                    error!("Too many same errors, stopping the program");
-                    break;
-                } else {
-                    info!("program restarting in 10 seconds ...");
-                    info!("Press CTRL + C to stop.");
-                    time::sleep(Duration::from_secs(10)).await;
-                    continue;
-                }
+        if result.is_err() {
+            if !last_query.is_empty() {
+                error!("WIKICRAWL CRASHED WITH LAST QUERY BEING");
+                error!("{}", last_query);
+            } else {
+                error!("WIKICRAWL CRASHED");
             }
-            None => {
-                error!("Couldn't find error code in error message");
-                error!("Stopping the program");
+            let error = result.unwrap_err().to_string();
+            error!("{}", error);
+
+            last_query = format!(
+                "UPDATE Pages SET bugged = TRUE WHERE id IN ({});",
+                exploring_pages
+                    .into_iter()
+                    .map(|page| page.id.to_string())
+                    .collect::<Vec<String>>()
+                    .join(",")
+            );
+            error!("");
+            error!("Marking all unexplored pages as bugged");
+            error!("executing query {}", last_query);
+            connection.query_drop(last_query).unwrap_or_else(|e| {
+                error!("couldn't mark all unexplored pages as bugged");
+                error!("{}", e);
+            });
+
+            let error_captures = error_regex.captures(&error);
+            match error_captures {
+                Some(capture) => {
+                    let error_code = capture.get(1).unwrap().as_str().parse::<usize>().unwrap();
+                    let count = error_count
+                        .entry(error_code)
+                        .and_modify(|counter| *counter += 1)
+                        .or_insert(1);
+                    if *count > MAX_SAME_ERROR {
+                        error!("Too many same errors, stopping the program");
+                        break;
+                    } else {
+                        info!("program restarting in 10 seconds ...");
+                        info!("Press CTRL + C to stop.");
+                        time::sleep(Duration::from_secs(10)).await;
+                        continue;
+                    }
+                }
+                None => {
+                    error!("Couldn't find error code in error message");
+                    error!("Stopping the program");
+                }
             }
         }
 
@@ -415,16 +414,20 @@ async fn wikicrawl(
             );
 
             // split found_pages into new_pages and found_again_pages using the connection
-            last_query.clear();
-            last_query.push_str(&format!(
-                "SELECT id FROM Pages WHERE id IN ({});",
-                found_pages
-                    .iter()
-                    .map(|(_, page)| page.id.to_string())
-                    .collect::<Vec<String>>()
-                    .join(","),
-            ));
-            let found_again_pages_ids = connection.query_map(&last_query, |id: usize| id)?;
+            let found_again_pages_ids = if found_pages.is_empty() {
+                Vec::new()
+            } else {
+                last_query.clear();
+                last_query.push_str(&format!(
+                    "SELECT id FROM Pages WHERE id IN ({});",
+                    found_pages
+                        .iter()
+                        .map(|(_, page)| page.id.to_string())
+                        .collect::<Vec<String>>()
+                        .join(","),
+                ));
+                connection.query_map(&last_query, |id: usize| id)?
+            };
 
             let (found_again_pages, new_pages): (HashMap<String, Page>, HashMap<String, Page>) =
                 found_pages
@@ -517,9 +520,9 @@ async fn wikicrawl(
         last_query.clear();
         last_query.push_str(&format!(
             "UPDATE Pages SET explored = TRUE WHERE id IN ({});",
-            results
+            exploring_pages
                 .iter()
-                .map(|(page, _)| page.id.to_string())
+                .map(|page| page.id.to_string())
                 .collect::<Vec<String>>()
                 .join(", "),
         ));
