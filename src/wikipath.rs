@@ -33,7 +33,7 @@ pub async fn setup_wikipath(connection: &mut PooledConn) {
             "The smallest path is: \n{{\n{}\n}}",
             pages
                 .into_iter()
-                .map(|page| format!("->  Page: {}", page))
+                .map(|(page, link)| format!("->  \"{}\" Page: {}", link, page))
                 .collect::<Vec<String>>()
                 .join("\n")
         );
@@ -47,7 +47,7 @@ async fn get_page(connection: &mut PooledConn, request_message: &str) -> Page {
         stdout().flush().unwrap();
         user_input.clear();
         stdin().read_line(&mut user_input).unwrap();
-        let page_title = {
+        let mut page_title = {
             if user_input.starts_with("http") {
                 let temp = user_input.split("wiki/").last().unwrap();
                 if temp.starts_with("Spécial:Recherche/") {
@@ -60,31 +60,43 @@ async fn get_page(connection: &mut PooledConn, request_message: &str) -> Page {
             }
         }
         .to_ascii_lowercase();
+        page_title.pop();
 
+        let formatted_link = format_link_for_mysql(&page_title);
+        let query = format!(
+            "
+SELECT id, title
+FROM ( 
+    ( 
+        SELECT Pages.id, Pages.title, Alias.alias 
+        FROM Pages 
+        JOIN Alias ON Alias.id = Pages.id 
+        WHERE MATCH(title) AGAINST ('{formatted_link}' IN BOOLEAN MODE) 
+    ) 
+    UNION 
+    ( 
+        SELECT Pages.id, Pages.title, Alias.alias 
+        FROM Pages 
+        JOIN Alias ON Alias.id = Pages.id 
+        WHERE MATCH(alias) AGAINST ('{formatted_link}' IN BOOLEAN MODE) 
+    ) 
+) AS result 
+WHERE title = '{formatted_link}' OR alias = '{formatted_link}';"
+        );
+
+        println!("querying database");
         let page = connection
-			.query_map(format!(
-				"SELECT Pages.id, Pages.title FROM Pages JOIN Alias ON Pages.id = Alias.id WHERE LOWER(title) = \"{}\" OR alias = \"{}\";",
-				format_link_for_mysql(&page_title),
-				format_link_for_mysql(&page_title)
-			), |(id, title): (usize, String)| Page { id, title }).unwrap_or(Vec::new());
+            .query_map(query, |(id, title): (usize, String)| Page { id, title })
+            .unwrap_or(Vec::new());
 
         let page = if page.is_empty() {
+            println!("no pages found in the database, querying wikipedia");
             extract_link_info_api(&page_title).await
         } else {
             page.first().unwrap().to_owned()
         };
 
-        if connection
-            .query_first::<(usize, String), _>(format!(
-                "SELECT * FROM Pages WHERE id = {} AND explored = TRUE;",
-                page.id
-            ))
-            .unwrap()
-            .is_some()
-        {
-            return page;
-        }
-        println!("That page isn't explored yet");
+        return page;
     }
 }
 
@@ -93,12 +105,12 @@ fn wikipath(
     connection: &mut PooledConn,
     start_page: Page,
     end_page: Page,
-) -> Result<Vec<Page>, mysql::Error> {
+) -> Result<Vec<(Page, String)>, mysql::Error> {
     // exploring the database
     // we only collect the first time where a page is linked to another page
     // because we are looking for the shortest path, since we are exploring the database depth by depth,
     // we can be sure that the first time we find a page, it's one of the shortest path to it
-    let mut is_linked_first: HashMap<usize, usize> = HashMap::new();
+    let mut is_linked_first: HashMap<usize, (usize, String)> = HashMap::new();
     let mut exploring_pages_id: Vec<usize> = vec![start_page.id];
 
     'truc: for depth in 0.. {
@@ -118,20 +130,21 @@ fn wikipath(
                     .join(",")
             ));
 
-            let pages = connection.query_map(&last_query, |(linker, linked): (usize, usize)| {
-                (linker, linked)
-            })?;
+            let pages = connection.query_map(
+                &last_query,
+                |(linker, linked, display): (usize, usize, String)| (linker, linked, display),
+            )?;
 
-            pages.clone().into_iter().for_each(|(linker, linked)| {
+            pages.iter().for_each(|(linker, linked, display)| {
                 if !is_linked_first.contains_key(&linked) {
-                    next_exploring_pages_id.push(linked);
-                    is_linked_first.insert(linked, linker);
+                    next_exploring_pages_id.push(*linked);
+                    is_linked_first.insert(*linked, (*linker, display.clone()));
                 }
             });
 
             if pages
                 .iter()
-                .find(|(_, linked)| end_page.id.eq(linked))
+                .find(|(_, linked, _display)| end_page.id.eq(linked))
                 .is_some()
             {
                 println!("found end page");
@@ -161,11 +174,11 @@ fn wikipath(
 
     // backtrack the smallest path
     print!("backtracking the smallest path \n{}", end_page.id);
-    let mut path: Vec<usize> = vec![end_page.id];
-    while let Some(&last_page) = path.last() {
-        let next_page = is_linked_first.get(&last_page).unwrap();
-        path.push(next_page.clone());
-        print!(" -> {}", next_page);
+    let mut path: Vec<(usize, String)> = vec![(end_page.id, String::new())];
+    while let Some((last_page, _last_link)) = path.last() {
+        let (next_page, next_link) = is_linked_first.get(last_page).unwrap();
+        path.push((*next_page, next_link.clone()));
+        print!(" -> {} by \"{}\"", next_page, next_link);
         if next_page.eq(&start_page.id) {
             break;
         }
@@ -177,7 +190,7 @@ fn wikipath(
     last_query.push_str(&format!(
         "SELECT id,title from Pages where id IN ({});",
         path.iter()
-            .map(|id| id.to_string())
+            .map(|(id, _link)| id.to_string())
             .collect::<Vec<String>>()
             .join(",")
     ));
@@ -190,12 +203,17 @@ fn wikipath(
 
     let final_path = path
         .into_iter()
-        .map(|id| Page {
-            id,
-            title: id_to_title.get(&id).unwrap().clone(),
+        .map(|(id, link)| {
+            (
+                Page {
+                    id,
+                    title: id_to_title.get(&id).unwrap().clone(),
+                },
+                link,
+            )
         })
         .rev()
-        .collect::<Vec<Page>>();
+        .collect::<Vec<(Page, String)>>();
 
     Ok(final_path)
 }
