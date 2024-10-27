@@ -132,19 +132,21 @@ fn wikipath(
 
             let pages = connection.query_map(
                 &last_query,
-                |(linker, linked, display): (usize, usize, String)| (linker, linked, display),
+                |(linker, linked, displayed_link): (usize, usize, String)| {
+                    (linker, linked, displayed_link)
+                },
             )?;
 
-            pages.iter().for_each(|(linker, linked, display)| {
+            pages.iter().for_each(|(linker, linked, displayed_link)| {
                 if !is_linked_first.contains_key(&linked) {
                     next_exploring_pages_id.push(*linked);
-                    is_linked_first.insert(*linked, (*linker, display.clone()));
+                    is_linked_first.insert(*linked, (*linker, displayed_link.clone()));
                 }
             });
 
             if pages
                 .iter()
-                .find(|(_, linked, _display)| end_page.id.eq(linked))
+                .find(|(_, linked, _displayed_link)| end_page.id.eq(linked))
                 .is_some()
             {
                 println!("found end page");

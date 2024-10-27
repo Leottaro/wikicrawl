@@ -57,7 +57,7 @@ lazy_static! {
     )
     .unwrap();
     pub static ref EXPLORE_REGEX: Regex =
-        Regex::new(r#"(?m)<a[^<>]+?"\/wiki\/([^"\/]+?)(?:#.+?)?".+?>(.+?)<\/a>"#).unwrap();
+        Regex::new(r#"(?m)<a[^<>]+?"\/wiki\/([^"\/]+?)(?:#.+?)?".+?>([^<>]+?)<\/a>"#).unwrap();
     pub static ref CLIENT: Client = ClientBuilder::new()
         .connect_timeout(RETRY_COOLDOWN.mul(10))
         .connection_verbose(true)

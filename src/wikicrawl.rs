@@ -327,7 +327,12 @@ async fn wikicrawl(
 
         let found_links = results
             .iter()
-            .map(|(_, links)| links.clone().into_iter().map(|(link, _display)| link))
+            .map(|(_, links)| {
+                links
+                    .clone()
+                    .into_iter()
+                    .map(|(link, _displayed_link)| link)
+            })
             .flatten()
             .collect::<HashSet<String>>();
         info!("found {} links", found_links.len());
@@ -490,9 +495,9 @@ async fn wikicrawl(
                 .map(|(page, links)| {
                     links
                         .iter()
-                        .filter_map(|(link, display)| {
+                        .filter_map(|(link, displayed_link)| {
                             let linked = old_pages.get(link).or(new_pages.get(link));
-                            linked.map(|link| (page, link, display))
+                            linked.map(|link| (page, link, displayed_link))
                         })
                         .collect::<HashSet<(&Page, &Page, &String)>>()
                 })
@@ -503,14 +508,14 @@ async fn wikicrawl(
             // insert the new relations
             last_query.clear();
             last_query.push_str(&format!(
-                "INSERT INTO Links (linker, linked, display) VALUES {};",
+                "INSERT INTO Links (linker, linked, displayed_link) VALUES {};",
                 relations_found
                     .iter()
-                    .map(|(linker, linked, display)| format!(
+                    .map(|(linker, linked, displayed_link)| format!(
                         "({},{},\"{}\")",
                         linker.id,
                         linked.id,
-                        format_link_for_mysql(display)
+                        format_link_for_mysql(displayed_link)
                     ))
                     .collect::<Vec<String>>()
                     .join(", "),
@@ -585,7 +590,7 @@ async fn explore(page: &Page) -> Result<Vec<(String, String)>, Box<dyn Error>> {
 
         let filtered_links = found_links
             .into_iter()
-            .filter(|(link, _display)| {
+            .filter(|(link, _displayed_link)| {
                 !WIKIPEDIA_NAMESPACES
                     .iter()
                     .any(|namespace| link.starts_with(namespace))

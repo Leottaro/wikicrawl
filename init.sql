@@ -25,9 +25,10 @@ CREATE TABLE IF NOT EXISTS Links (
   linker INT UNSIGNED NOT NULL,
   linked INT UNSIGNED NOT NULL,
   display VARCHAR(255) COLLATE utf8mb4_bin NOT NULL,
-  PRIMARY KEY (linker, linked),
+  PRIMARY KEY (linker, linked, display),
   KEY linker_index (linker),
   KEY linked_index (linked),
+  FULLTEXT KEY display_fulltext (display),
   FOREIGN KEY linker_foreign (linker) REFERENCES Pages(id),
   FOREIGN KEY linked_foreign (linked) REFERENCES Pages(id)
 );
