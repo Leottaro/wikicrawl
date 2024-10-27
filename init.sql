@@ -7,22 +7,27 @@ CREATE TABLE IF NOT EXISTS Pages (
   title VARCHAR(255) COLLATE utf8mb4_bin UNIQUE NOT NULL,
   explored BOOLEAN DEFAULT false,
   bugged BOOLEAN DEFAULT false,
-  PRIMARY KEY (id),
-  FULLTEXT(title)
+  PRIMARY KEY id_primary (id),
+  KEY id_index (id),
+  FULLTEXT KEY title_fulltext (title)
 );
 
 CREATE TABLE IF NOT EXISTS Alias (
   alias VARCHAR(255) COLLATE utf8mb4_bin UNIQUE NOT NULL,
   id INT UNSIGNED NOT NULL,
   PRIMARY KEY (alias, id),
-  FOREIGN KEY (id) REFERENCES Pages(id),
-  FULLTEXT(alias)
+  KEY id_index (id),
+  FULLTEXT KEY alias_fulltext (alias),
+  FOREIGN KEY (id) REFERENCES Pages(id)
 );
 
 CREATE TABLE IF NOT EXISTS Links (
   linker INT UNSIGNED NOT NULL,
   linked INT UNSIGNED NOT NULL,
+  display VARCHAR(255) COLLATE utf8mb4_bin NOT NULL,
   PRIMARY KEY (linker, linked),
+  KEY linker_index (linker),
+  KEY linked_index (linked),
   FOREIGN KEY (linker) REFERENCES Pages(id),
   FOREIGN KEY (linked) REFERENCES Pages(id)
 );

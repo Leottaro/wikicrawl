@@ -248,9 +248,9 @@ async fn wikicrawl(
         ));
         connection.query_drop(&last_query)?;
 
-        let mut results: Vec<(Page, Vec<String>)> = Vec::new();
+        let mut results: Vec<(Page, Vec<(String, String)>)> = Vec::new();
         let mut bugged_pages: Vec<Page> = Vec::new();
-        let mut children: Vec<JoinHandle<(Page, Option<Vec<String>>)>> = Vec::new();
+        let mut children: Vec<JoinHandle<(Page, Option<Vec<(String, String)>>)>> = Vec::new();
         let now = Instant::now();
         let shared_explored_count = Arc::new(Mutex::new(0 as usize));
 
@@ -327,7 +327,7 @@ async fn wikicrawl(
 
         let found_links = results
             .iter()
-            .map(|(_, links)| links.clone())
+            .map(|(_, links)| links.clone().into_iter().map(|(link, _display)| link))
             .flatten()
             .collect::<HashSet<String>>();
         info!("found {} links", found_links.len());
@@ -490,23 +490,28 @@ async fn wikicrawl(
                 .map(|(page, links)| {
                     links
                         .iter()
-                        .filter_map(|link| {
+                        .filter_map(|(link, display)| {
                             let linked = old_pages.get(link).or(new_pages.get(link));
-                            linked.map(|link| (page, link))
+                            linked.map(|link| (page, link, display))
                         })
-                        .collect::<HashSet<(&Page, &Page)>>()
+                        .collect::<HashSet<(&Page, &Page, &String)>>()
                 })
                 .flatten()
-                .collect::<HashSet<(&Page, &Page)>>();
+                .collect::<HashSet<(&Page, &Page, &String)>>();
             info!("generated {} relations", relations_found.len());
 
             // insert the new relations
             last_query.clear();
             last_query.push_str(&format!(
-                "INSERT INTO Links (linker, linked) VALUES {};",
+                "INSERT INTO Links (linker, linked, display) VALUES {};",
                 relations_found
                     .iter()
-                    .map(|(linker, linked)| format!("({},{})", linker.id, linked.id))
+                    .map(|(linker, linked, display)| format!(
+                        "({},{},\"{}\")",
+                        linker.id,
+                        linked.id,
+                        format_link_for_mysql(display)
+                    ))
                     .collect::<Vec<String>>()
                     .join(", "),
             ));
@@ -544,7 +549,7 @@ async fn wikicrawl(
     return Ok(());
 }
 
-async fn explore(page: &Page) -> Result<Vec<String>, Box<dyn Error>> {
+async fn explore(page: &Page) -> Result<Vec<(String, String)>, Box<dyn Error>> {
     let request = format!("https://fr.m.wikipedia.org/?curid={}", page.id);
 
     let mut retry_cooldown = RETRY_COOLDOWN.clone();
@@ -569,21 +574,23 @@ async fn explore(page: &Page) -> Result<Vec<String>, Box<dyn Error>> {
         let found_links = EXPLORE_REGEX
             .captures_iter(body.as_str())
             .map(|captures| {
-                decode(captures.get(1).unwrap().as_str())
+                let link = decode(captures.get(1).unwrap().as_str())
                     .unwrap()
                     .into_owned()
-                    .to_ascii_lowercase()
+                    .to_ascii_lowercase();
+                let displayed_link = captures.get(2).unwrap().as_str().to_string();
+                (link, displayed_link)
             })
-            .collect::<HashSet<String>>();
+            .collect::<HashSet<(String, String)>>();
 
         let filtered_links = found_links
             .into_iter()
-            .filter(|link| {
+            .filter(|(link, _display)| {
                 !WIKIPEDIA_NAMESPACES
                     .iter()
                     .any(|namespace| link.starts_with(namespace))
             })
-            .collect::<Vec<String>>();
+            .collect::<Vec<(String, String)>>();
 
         if filtered_links.is_empty() {
             warn!(
