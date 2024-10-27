@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS Pages (
   title VARCHAR(255) COLLATE utf8mb4_bin UNIQUE NOT NULL,
   explored BOOLEAN DEFAULT false,
   bugged BOOLEAN DEFAULT false,
-  PRIMARY KEY id_primary (id),
+  PRIMARY KEY (id),
   KEY id_index (id),
   FULLTEXT KEY title_fulltext (title)
 );
@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS Alias (
   PRIMARY KEY (alias, id),
   KEY id_index (id),
   FULLTEXT KEY alias_fulltext (alias),
-  FOREIGN KEY (id) REFERENCES Pages(id)
+  FOREIGN KEY id_foreign (id) REFERENCES Pages(id)
 );
 
 CREATE TABLE IF NOT EXISTS Links (
@@ -28,8 +28,8 @@ CREATE TABLE IF NOT EXISTS Links (
   PRIMARY KEY (linker, linked),
   KEY linker_index (linker),
   KEY linked_index (linked),
-  FOREIGN KEY (linker) REFERENCES Pages(id),
-  FOREIGN KEY (linked) REFERENCES Pages(id)
+  FOREIGN KEY linker_foreign (linker) REFERENCES Pages(id),
+  FOREIGN KEY linked_foreign (linked) REFERENCES Pages(id)
 );
 
 INSERT INTO Pages (id, title) VALUES (1095, "France");
