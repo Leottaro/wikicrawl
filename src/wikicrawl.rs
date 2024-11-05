@@ -58,6 +58,26 @@ struct TotalInfo {
     links: usize,
 }
 
+struct Link<'a> {
+    linker: usize,
+    linked: usize,
+    display: &'a String,
+}
+
+impl<'a> PartialEq for Link<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        self.linker == other.linker && self.linked == other.linked
+    }
+}
+impl<'a> Eq for Link<'a> {}
+
+impl<'a> std::hash::Hash for Link<'a> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.linker.hash(state);
+        self.linked.hash(state);
+    }
+}
+
 pub async fn setup_wikicrawl(
     connection: &mut PooledConn,
     max_exploring_pages: usize,
@@ -327,12 +347,7 @@ async fn wikicrawl(
 
         let found_links = results
             .iter()
-            .map(|(_, links)| {
-                links
-                    .clone()
-                    .into_iter()
-                    .map(|(link, _displayed_link)| link)
-            })
+            .map(|(_, links)| links.clone().into_iter().map(|(link, _display)| link))
             .flatten()
             .collect::<HashSet<String>>();
         info!("found {} links", found_links.len());
@@ -495,27 +510,31 @@ async fn wikicrawl(
                 .map(|(page, links)| {
                     links
                         .iter()
-                        .filter_map(|(link, displayed_link)| {
+                        .filter_map(|(link, display)| {
                             let linked = old_pages.get(link).or(new_pages.get(link));
-                            linked.map(|link| (page, link, displayed_link))
+                            linked.map(|link| Link {
+                                linker: page.id,
+                                linked: link.id,
+                                display: display,
+                            })
                         })
-                        .collect::<HashSet<(&Page, &Page, &String)>>()
+                        .collect::<HashSet<Link>>()
                 })
                 .flatten()
-                .collect::<HashSet<(&Page, &Page, &String)>>();
+                .collect::<HashSet<Link>>();
             info!("generated {} relations", relations_found.len());
 
             // insert the new relations
             last_query.clear();
             last_query.push_str(&format!(
-                "INSERT INTO Links (linker, linked, displayed_link) VALUES {};",
+                "INSERT INTO Links (linker, linked, display) VALUES {};",
                 relations_found
                     .iter()
-                    .map(|(linker, linked, displayed_link)| format!(
+                    .map(|link| format!(
                         "({},{},\"{}\")",
-                        linker.id,
-                        linked.id,
-                        format_link_for_mysql(displayed_link)
+                        link.linker,
+                        link.linked,
+                        format_link_for_mysql(&link.display)
                     ))
                     .collect::<Vec<String>>()
                     .join(", "),
@@ -583,14 +602,14 @@ async fn explore(page: &Page) -> Result<Vec<(String, String)>, Box<dyn Error>> {
                     .unwrap()
                     .into_owned()
                     .to_ascii_lowercase();
-                let displayed_link = captures.get(2).unwrap().as_str().to_string();
-                (link, displayed_link)
+                let display = captures.get(2).unwrap().as_str().to_string();
+                (link, display)
             })
             .collect::<HashSet<(String, String)>>();
 
         let filtered_links = found_links
             .into_iter()
-            .filter(|(link, _displayed_link)| {
+            .filter(|(link, _display)| {
                 !WIKIPEDIA_NAMESPACES
                     .iter()
                     .any(|namespace| link.starts_with(namespace))
